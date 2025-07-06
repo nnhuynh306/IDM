@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <bytecodeTargetLevel>
+      <module name="IDM.download-mananger.main" target="11" />
+      <module name="IDM.download-mananger.test" target="11" />
+      <module name="IDM.DownloadMananger" target="11" />
+      <module name="IDM.DownloadMananger.main" target="11" />
+      <module name="IDM.DownloadMananger.test" target="11" />
+    </bytecodeTargetLevel>
+  </component>
+</project>
