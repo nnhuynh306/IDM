@@ -11,10 +11,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newSingleThreadContext
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -39,15 +43,16 @@ fun createExecutor(request: DownloadRequest): NetworkTaskExecutor {
             byteCount: Int,
             name: String
         ) {
-            val fos: FileOutputStream
-            if (mapFile.contains(name)) {
-                fos = mapFile[name]!!
-            } else {
-                fos = FileOutputStream(name, true)
-                mapFile[name] = fos
-            }
-
-            fos.write(byteArray, 0, byteCount);
+//            val fos: FileOutputStream
+//            if (mapFile.contains(name)) {
+//                fos = mapFile[name]!!
+//            } else {
+//                fos = FileOutputStream(name, true)
+//                mapFile[name] = fos
+//            }
+//
+//            fos.write(byteArray, 0, byteCount);
+//            print("save")
         }
 
 
@@ -75,7 +80,7 @@ interface NetworkTaskExecutor {
 
 
 interface DownloadConnection {
-    fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>>
+    suspend fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>>
     fun close()
     fun stop()
     fun getStart(): Long
@@ -117,52 +122,35 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
         return progressState
     }
 
+    @Suppress("NewApi")
     private fun executeInBackground() {
         executorScope.launch {
             initialize()
 
             for (task in tasks) {
-                pushTask(task)
+                launch {
+                    pushTask(task)
+                }
             }
+
+
+            println("finish")
         }
     }
 
-    var count = 0
     @Suppress("NewApi")
     suspend fun pushTask(task: DownloadTask) = coroutineScope {
         val connection = downloadConnectionPool.getConnectionFor(task)
-        executorScope.launch {
+        launch(Dispatchers.Default) {
             connection.getProgress()
                 .collect {
-                    println("test download speed ${(it.speed / 1024 / 1024)}")
-                    if (count++ == 2) {
-                         _tryCreateNewTask()?.let {
-                             pushTask2(it)
-                         }
-                    }
+                    println("test download speed task ${(it.speed / 1024 / 1024)}")
                 }
         }
-        executorScope.launch {
+        launch(Dispatchers.IO) {
             connection.execute(task).collect {
 //                storage.savePartFile(byteArray = it.second, byteCount = it.first, task.start.toString() + "_file.part")
                 storage.savePartFile(byteArray = it.second, byteCount = it.first, "/" + Paths.get(URI(task.url).getPath()).getFileName().toString())
-            }
-        }
-    }
-
-
-    suspend fun pushTask2(task: DownloadTask) = coroutineScope {
-        val connection = downloadConnectionPool.getConnectionFor(task)
-        executorScope.launch {
-            connection.getProgress()
-                .collect {
-                    println("test download speed 2 ${(it.speed / 1024 / 1024)}")
-                }
-        }
-        executorScope.launch {
-            connection.execute(task).collect {
-                println(it.second)
-//                storage.savePartFile(byteArray = it.second, byteCount = it.first, task.start.toString() + "_file.part")
             }
         }
     }
@@ -175,9 +163,15 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
             throw Exception("Null Header request")
         }
 
+        val median = headerRequestInfo.contentLength / 2
         tasks.add(DownloadTask(
             url = request.url,
             start = 0,
+            end = median
+        ))
+        tasks.add(DownloadTask(
+            url = request.url,
+            start = median + 1,
             end = headerRequestInfo.contentLength
         ))
     }
@@ -271,40 +265,41 @@ internal class DownloadConnectionImpl(url: String): NetworkConnection(url), Down
     private var mutex = Mutex()
 
     @OptIn(DelicateCoroutinesApi::class, ExperimentalCoroutinesApi::class)
-    override fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>> = channelFlow  {
-        launch(newSingleThreadContext(task.start.toString())) {
-            updateTask(task)
+    override suspend fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>> = flow  {
+        println("start in ${task.start}")
+        updateTask(task)
 
-            connection.connect()
+        connection.connect()
 
-            byteDownloaded.reset()
+        byteDownloaded.reset()
 
-            if (connection.responseCode == HttpURLConnection.HTTP_PARTIAL) {
-                monitorStart = System.currentTimeMillis()
-                val inputStream = connection.inputStream
-                var byteRead = pageSize
-                while (byteRead != -1) {
-                    val remain =  end.get() - (byteDownloaded.toLong() + start.get())
-                    val buffer = ByteArray(remain.coerceAtMost(pageSize.toLong()).toInt())
+        println("response code of ${task.start} is ${connection.responseCode}")
 
-                    byteRead = inputStream.read(buffer)
+        if (connection.responseCode == HttpURLConnection.HTTP_PARTIAL) {
+            monitorStart = System.currentTimeMillis()
+            val inputStream = connection.inputStream
+            var byteRead = pageSize
+            while (byteRead != -1) {
+                val remain =  end.get() - (byteDownloaded.toLong() + start.get())
+                val buffer = ByteArray(remain.coerceAtMost(pageSize.toLong()).toInt())
 
-                    val shouldBreak: Boolean
-                    mutex.withLock {
-                        if (byteRead != -1) {
-                            byteDownloaded.add(byteRead.toLong())
-                            task.byteDownloaded.add(byteRead.toLong())
-                        }
-                        shouldBreak = byteDownloaded.toLong() + task.start >= task.end
+                byteRead = inputStream.read(buffer)
+
+                val shouldBreak: Boolean
+                mutex.withLock {
+                    if (byteRead != -1) {
+                        byteDownloaded.add(byteRead.toLong())
+                        task.byteDownloaded.add(byteRead.toLong())
                     }
-                    if (shouldBreak) {
-                        break
-                    }
-
-                    send(Pair(byteRead, buffer))
+                    shouldBreak = byteDownloaded.toLong() + task.start >= task.end
                 }
-                inputStream.close()
+                if (shouldBreak) {
+                    break
+                }
+
+                emit(Pair(byteRead, buffer))
             }
+            inputStream.close()
         }
     }
 
