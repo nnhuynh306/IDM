@@ -1,97 +1,116 @@
 package com.example.download_mananger.network
 
-import androidx.annotation.RequiresApi
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.channelFlow
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.newSingleThreadContext
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.yield
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URI
-import java.nio.file.Paths
-import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.LongAdder
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 fun createExecutor(request: DownloadRequest): NetworkTaskExecutor {
-    return DynamicSegmentNetworkTaskExecutor(request, object : Storage {
-        val mapFile: HashMap<String, FileOutputStream> = hashMapOf()
-        override suspend fun getDirectory(): File {
-            TODO("Not yet implemented")
-        }
-
-        override suspend fun savePartFile(
-            byteArray: ByteArray,
-            byteCount: Int,
-            name: String
-        ) {
-//            val fos: FileOutputStream
-//            if (mapFile.contains(name)) {
-//                fos = mapFile[name]!!
-//            } else {
-//                fos = FileOutputStream(name, true)
-//                mapFile[name] = fos
-//            }
-//
-//            fos.write(byteArray, 0, byteCount);
-//            print("save")
-        }
-
-
-        override suspend fun getListTask(): File {
-            TODO("Not yet implemented")
-        }
-
-    })
+    return DynamicSegmentNetworkTaskExecutor(request, StorageImpl(request.saveFileName))
 }
-
-class Progress(
-    val byteDownloaded: Long = 0,
-    val speed: Double = 0.0,
-)
 
 interface Storage {
     suspend fun getDirectory(): File
     suspend fun savePartFile(byteArray: ByteArray, byteCount: Int, name: String)
     suspend fun getListTask(): File
+    suspend fun finish()
+}
+
+internal class StorageImpl(val destination: String): Storage {
+    val mapFile: ConcurrentHashMap<String, FileOutputStream> = ConcurrentHashMap()
+
+    val directory = File("./temp")
+    override suspend fun getDirectory(): File {
+        return directory
+    }
+
+    override suspend fun savePartFile(
+        byteArray: ByteArray,
+        byteCount: Int,
+        name: String
+    ) {
+        synchronized(directory) {
+            if (!directory.exists()) {
+                directory.mkdirs()
+            }
+        }
+        val fos: FileOutputStream
+        if (mapFile.contains(name)) {
+            fos = mapFile[name]!!
+        } else {
+            val filePath = directory.path + "/" + name
+            val file = File(filePath)
+            fos = FileOutputStream(filePath, true)
+            mapFile[name] = fos
+        }
+
+        try {
+            fos.write(byteArray, 0, byteCount);
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+
+    override suspend fun getListTask(): File {
+        TODO("Not yet implemented")
+    }
+
+    override suspend fun finish() {
+        withContext(Dispatchers.Default.limitedParallelism(1)) {
+            for (fos in mapFile.values) {
+                fos.close()
+            }
+            val destinationFile = File(directory.path + "/" + destination)
+            val buffer = ByteArray(8192)
+            FileOutputStream(destinationFile, true).use { desFos ->
+                for (file in directory.listFiles().filter {
+                    it.name != destination
+                }.toList().sortedBy {
+                    it.name.substring(it.name.lastIndexOf("_") + 1).toInt()
+                }) {
+                    val fis = FileInputStream(file)
+                    var byteRead = 0
+                    while (true) {
+                        byteRead = fis.read(buffer)
+                        if (byteRead == -1) {
+                            break
+                        }
+                        desFos.write(buffer, 0, byteRead)
+                    }
+                    fis.close()
+                    file.delete()
+                }
+            }
+        }
+    }
+
 }
 
 interface NetworkTaskExecutor {
-    fun execute(): Flow<Progress>
-}
-
-
-interface DownloadConnection {
-    suspend fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>>
-    fun close()
-    fun stop()
-    fun getStart(): Long
-    fun getProgress(): Flow<Progress>
-    suspend fun updateNewEnd(end: Long): Boolean
+    fun execute(): Flow<DownloadProgress>
 }
 
 data class DownloadRequest(
     val url: String,
+    val saveFileName: String,
 )
 
+@Suppress("NewApi")
 data class DownloadTask(
     val url: String,
     val start: Long,
@@ -105,6 +124,15 @@ data class DownloadTask(
     fun isFinished(): Boolean {
         return end - start <= byteSaved
     }
+
+    fun getPartFileName(finalFileName: String): String {
+        val fileName = if(finalFileName.contains(".")) {
+            finalFileName.substring(0, finalFileName.lastIndexOf('.'))
+        } else {
+            finalFileName
+        }
+        return fileName + "_" + start
+    }
 }
 
 internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, val storage: Storage): NetworkTaskExecutor {
@@ -112,11 +140,11 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
 
     private val downloadConnectionPool = DownloadConnectionPool(url = request.url)
 
-    private val progressState = MutableStateFlow(Progress(0, 0.0))
+    private val progressState = MutableStateFlow(DownloadProgress(0, 0.0))
 
     private val executorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    override fun execute(): Flow<Progress> {
+    override fun execute(): Flow<DownloadProgress> {
         executeInBackground()
 
         return progressState
@@ -127,14 +155,16 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
         executorScope.launch {
             initialize()
 
+            val jobs = arrayListOf<Deferred<*>>()
             for (task in tasks) {
-                launch {
+                jobs.add(async {
                     pushTask(task)
-                }
+                })
             }
 
-
-            println("finish")
+            jobs.awaitAll()
+            storage.finish()
+            progressState.emit(DownloadProgress(0, 100.0))
         }
     }
 
@@ -149,8 +179,7 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
         }
         launch(Dispatchers.IO) {
             connection.execute(task).collect {
-//                storage.savePartFile(byteArray = it.second, byteCount = it.first, task.start.toString() + "_file.part")
-                storage.savePartFile(byteArray = it.second, byteCount = it.first, "/" + Paths.get(URI(task.url).getPath()).getFileName().toString())
+                storage.savePartFile(byteArray = it.second, byteCount = it.first, task.getPartFileName(request.saveFileName))
             }
         }
     }
@@ -171,9 +200,16 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
         ))
         tasks.add(DownloadTask(
             url = request.url,
-            start = median + 1,
+            start = median,
             end = headerRequestInfo.contentLength
         ))
+
+
+//        tasks.add(DownloadTask(
+//            url = request.url,
+//            start = 0,
+//            end = headerRequestInfo.contentLength
+//        ))
     }
 
     private suspend fun _tryCreateNewTask(): DownloadTask? {
@@ -204,177 +240,6 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
                 url = largestRemainTask.url,
                 start = newEnd + 1,
                 end = largestRemainTask.end,
-            )
-        } else {
-            null
-        }
-    }
-}
-
-class DownloadConnectionPool(val url: String) {
-    val connections: ConcurrentLinkedQueue<DownloadConnection> = ConcurrentLinkedQueue()
-    var connectionCount: LongAdder = LongAdder()
-
-    fun getConnectionFor(task: DownloadTask): DownloadConnection {
-        return findConnection(task) ?: addConnection()
-    }
-
-    fun findConnection(task: DownloadTask): DownloadConnection? {
-        synchronized(connections) {
-            for (connection in connections) {
-                if (connection.getStart() == task.start) {
-                    return connection
-                }
-            }
-        }
-        return null
-    }
-
-    fun addConnection(): DownloadConnection {
-        synchronized(connectionCount) {
-            val newConnection = DownloadConnectionImpl(url)
-            connections.add(newConnection)
-            connectionCount.add(1)
-            return newConnection
-        }
-    }
-
-    fun getConnectionCount(): Int {
-        return connectionCount.toInt()
-    }
-
-    fun cleanUp() {
-        while (connections.isNotEmpty()) {
-            connections.remove().close()
-        }
-    }
-}
-
-internal class DownloadConnectionImpl(url: String): NetworkConnection(url), DownloadConnection {
-    private val byteDownloaded = LongAdder()
-
-    companion object {
-        val pageSize = 8192
-    }
-
-    private var end: AtomicLong = AtomicLong(0)
-    private var start: AtomicLong = AtomicLong(0)
-
-    private var monitorStart: Long = 0
-
-    private var mutex = Mutex()
-
-    @OptIn(DelicateCoroutinesApi::class, ExperimentalCoroutinesApi::class)
-    override suspend fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>> = flow  {
-        println("start in ${task.start}")
-        updateTask(task)
-
-        connection.connect()
-
-        byteDownloaded.reset()
-
-        println("response code of ${task.start} is ${connection.responseCode}")
-
-        if (connection.responseCode == HttpURLConnection.HTTP_PARTIAL) {
-            monitorStart = System.currentTimeMillis()
-            val inputStream = connection.inputStream
-            var byteRead = pageSize
-            while (byteRead != -1) {
-                val remain =  end.get() - (byteDownloaded.toLong() + start.get())
-                val buffer = ByteArray(remain.coerceAtMost(pageSize.toLong()).toInt())
-
-                byteRead = inputStream.read(buffer)
-
-                val shouldBreak: Boolean
-                mutex.withLock {
-                    if (byteRead != -1) {
-                        byteDownloaded.add(byteRead.toLong())
-                        task.byteDownloaded.add(byteRead.toLong())
-                    }
-                    shouldBreak = byteDownloaded.toLong() + task.start >= task.end
-                }
-                if (shouldBreak) {
-                    break
-                }
-
-                emit(Pair(byteRead, buffer))
-            }
-            inputStream.close()
-        }
-    }
-
-    private fun updateTask(task: DownloadTask) {
-        start.set(task.start)
-        end.set(task.end)
-        connection.setRequestProperty("Range", "bytes=${task.start + task.byteSaved}-${task.end}")
-        connection.setRequestProperty("Connection", "close");
-    }
-
-    override fun close() {
-        connection.disconnect()
-    }
-
-    override fun stop() {
-        connection.inputStream.close()
-    }
-
-    override fun getStart(): Long {
-        return start.get()
-    }
-
-    override fun getProgress(): Flow<Progress> = channelFlow {
-        var byteStart = 0L
-        while (true) {
-            delay(1000)
-            val speed: Double
-            val byteDownloadedUntilNow: Long
-            synchronized(byteDownloaded) {
-                val startTime = monitorStart
-                monitorStart = System.currentTimeMillis()
-                byteDownloadedUntilNow = byteDownloaded.toLong()
-                speed = (byteDownloadedUntilNow - byteStart).toDouble() / ((System.currentTimeMillis() - startTime) / 1000.0)
-                byteStart = byteDownloadedUntilNow
-            }
-            send(Progress(byteDownloadedUntilNow, speed))
-        }
-    }
-
-    override suspend fun updateNewEnd(newEnd: Long): Boolean {
-        val result: Boolean
-        mutex.withLock {
-            if (byteDownloaded.toLong() > newEnd) {
-                result = false
-            } else {
-                end.set(newEnd)
-                result = true
-            }
-        }
-        return result
-    }
-}
-
-abstract class NetworkConnection(val url: String) {
-    protected val connection: HttpURLConnection = URI(url).toURL().openConnection() as HttpURLConnection
-
-
-}
-
-data class RequestInfo(
-    val contentLength: Long,
-    val acceptRange: Boolean,
-)
-
-class HeaderRequest(url: String): NetworkConnection(url) {
-
-    fun execute(): RequestInfo? {
-        connection.requestMethod = "HEAD"
-        connection.connectTimeout = 10000
-        connection.connect()
-
-        return if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-            return RequestInfo(
-                contentLength = connection.getHeaderField("Content-Length").toLong(),
-                acceptRange = connection.getHeaderField("Accept-Ranges").lowercase() == "true"
             )
         } else {
             null
