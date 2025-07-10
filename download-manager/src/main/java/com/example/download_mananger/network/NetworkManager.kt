@@ -9,6 +9,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
@@ -17,6 +19,9 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.LongAdder
 
 fun createExecutor(request: DownloadRequest): NetworkTaskExecutor {
@@ -49,13 +54,15 @@ internal class StorageImpl(val destination: String): Storage {
             }
         }
         val fos: FileOutputStream
-        if (mapFile.contains(name)) {
-            fos = mapFile[name]!!
-        } else {
-            val filePath = directory.path + "/" + name
-            val file = File(filePath)
-            fos = FileOutputStream(filePath, true)
-            mapFile[name] = fos
+        synchronized(mapFile) {
+            if (mapFile.containsKey(name)) {
+                fos = mapFile[name]!!
+            } else {
+                val filePath = directory.path + "/" + name
+                val file = File(filePath)
+                fos = FileOutputStream(filePath, true)
+                mapFile[name] = fos
+            }
         }
 
         try {
@@ -119,12 +126,6 @@ data class DownloadTask(
     val byteDownloaded: LongAdder = LongAdder(),
 ) {
 
-    var isRunning: Boolean = false
-
-    fun isFinished(): Boolean {
-        return end - start <= byteSaved
-    }
-
     fun getPartFileName(finalFileName: String): String {
         val fileName = if(finalFileName.contains(".")) {
             finalFileName.substring(0, finalFileName.lastIndexOf('.'))
@@ -136,11 +137,14 @@ data class DownloadTask(
 }
 
 internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, val storage: Storage): NetworkTaskExecutor {
-    private val tasks: ArrayList<DownloadTask> = arrayListOf()
+    private val tasks: ConcurrentLinkedQueue<DownloadTask> = ConcurrentLinkedQueue()
 
     private val downloadConnectionPool = DownloadConnectionPool(url = request.url)
 
     private val progressState = MutableStateFlow(DownloadProgress(0, 0.0))
+
+    private val totalByteDownloaded = LongAdder()
+    private var totalByteNeedToDownload = 0L
 
     private val executorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -149,6 +153,8 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
 
         return progressState
     }
+
+    private val currentSpeed = AtomicLong(0)
 
     @Suppress("NewApi")
     private fun executeInBackground() {
@@ -161,10 +167,14 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
                     pushTask(task)
                 })
             }
+        }
 
-            jobs.awaitAll()
-            storage.finish()
-            progressState.emit(DownloadProgress(0, 100.0))
+        executorScope.launch {
+            progressState.collect {
+                if (it.byteDownloaded >= totalByteNeedToDownload && totalByteNeedToDownload != 0L) {
+                    storage.finish();
+                }
+            }
         }
     }
 
@@ -174,6 +184,16 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
         launch(Dispatchers.Default) {
             connection.getProgress()
                 .collect {
+                    progressState.update { currentProgress ->
+                        DownloadProgress(
+                            byteDownloaded = it.byteDownloaded + currentProgress.byteDownloaded,
+                            speed = it.speed
+                        )
+                    }
+                    if (it.speed >= currentSpeed.get() * 1.5) {
+                        currentSpeed.set(it.speed.toLong());
+                        _tryCreateNewTask()
+                    }
                     println("test download speed task ${(it.speed / 1024 / 1024)}")
                 }
         }
@@ -186,33 +206,21 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
 
     private fun initialize() {
         val headerRequest = HeaderRequest(request.url)
-        val headerRequestInfo = headerRequest.execute()
+        val headerRequestInfo = headerRequest.execute() ?: throw Exception("Null Header request")
 
-        if (headerRequestInfo == null) {
-            throw Exception("Null Header request")
-        }
+        totalByteDownloaded.reset();
 
-        val median = headerRequestInfo.contentLength / 2
+
+        totalByteNeedToDownload = headerRequestInfo.contentLength
+
         tasks.add(DownloadTask(
             url = request.url,
             start = 0,
-            end = median
-        ))
-        tasks.add(DownloadTask(
-            url = request.url,
-            start = median,
             end = headerRequestInfo.contentLength
         ))
-
-
-//        tasks.add(DownloadTask(
-//            url = request.url,
-//            start = 0,
-//            end = headerRequestInfo.contentLength
-//        ))
     }
 
-    private suspend fun _tryCreateNewTask(): DownloadTask? {
+    private suspend fun _tryCreateNewTask() {
         var largestRemain: Long = -1
         var largestRemainTask: DownloadTask? = null
         for (task in tasks) {
@@ -224,25 +232,22 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
         }
 
         if (largestRemainTask == null) {
-            return null
+            return
         }
 
-        val connection = downloadConnectionPool.findConnection(largestRemainTask)
-        if (connection == null) {
-            return null
-        }
+        val connection = downloadConnectionPool.findConnection(largestRemainTask) ?: return
 
         val byteDownloaded = largestRemainTask.byteDownloaded.toLong()
         val newEnd = largestRemainTask.start + byteDownloaded +
                 ((largestRemainTask.end - largestRemainTask.start - byteDownloaded) / 2)
-        return if (connection.updateNewEnd(newEnd)) {
-            DownloadTask(
-                url = largestRemainTask.url,
-                start = newEnd + 1,
-                end = largestRemainTask.end,
-            )
-        } else {
-            null
+        if (connection.updateNewEnd(newEnd)) {
+            executorScope.launch {
+                pushTask(DownloadTask(
+                    url = largestRemainTask.url,
+                    start = newEnd + 1,
+                    end = largestRemainTask.end,
+                ));
+            }
         }
     }
 }

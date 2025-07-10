@@ -78,6 +78,7 @@ internal class DownloadConnectionImpl(url: String): NetworkConnection(url), Down
     private var start: AtomicLong = AtomicLong(0)
 
     private var monitorStart: Long = 0
+    private var monitorEnd: Long = 0
 
     private var mutex = Mutex()
 
@@ -95,7 +96,7 @@ internal class DownloadConnectionImpl(url: String): NetworkConnection(url), Down
         if (connection.responseCode == HttpURLConnection.HTTP_PARTIAL) {
             monitorStart = System.currentTimeMillis()
             val inputStream = connection.inputStream
-            var byteRead = pageSize
+            var byteRead: Int
             while (true) {
                 val remain =  end.get() - (byteDownloaded.toLong() + start.get())
                 val buffer = ByteArray(remain.coerceAtMost(pageSize.toLong()).toInt())
@@ -103,19 +104,22 @@ internal class DownloadConnectionImpl(url: String): NetworkConnection(url), Down
                 byteRead = inputStream.read(buffer)
 
                 val shouldBreak: Boolean
+                val remainBefore: Long
                 mutex.withLock {
+                    remainBefore = end.toLong() - (byteDownloaded.toLong() + start.toLong())
                     if (byteRead > 0) {
                         byteDownloaded.add(byteRead.toLong())
                         task.byteDownloaded.add(byteRead.toLong())
                     }
-                    shouldBreak = (byteDownloaded.toLong() + task.start > task.end) || byteRead <= 0
+                    shouldBreak = remainBefore <= 0 || byteRead <= 0
                 }
                 if (shouldBreak) {
                     break
                 }
 
-                send(Pair(byteRead, buffer))
+                send(Pair(byteRead.toLong().coerceAtMost(remainBefore).toInt(), buffer))
             }
+            monitorEnd = System.currentTimeMillis()
             inputStream.close()
         }
     }
@@ -154,14 +158,15 @@ internal class DownloadConnectionImpl(url: String): NetworkConnection(url), Down
                 val startTime = monitorStart
                 monitorStart = System.currentTimeMillis()
                 byteDownloadedUntilNow = byteDownloaded.toLong()
-                speed = (byteDownloadedUntilNow - byteStart).toDouble() / ((System.currentTimeMillis() - startTime) / 1000.0)
+                val endTime = if (monitorEnd > 0) monitorEnd else System.currentTimeMillis()
+                speed = (byteDownloadedUntilNow - byteStart).toDouble() / ((endTime - startTime) / 1000.0)
                 byteStart = byteDownloadedUntilNow
             }
             val isFinished = byteDownloadedUntilNow >= (end.get() - start.get())
+            send(DownloadProgress(byteDownloadedUntilNow, speed))
             if (isFinished) {
                 break
             }
-            send(DownloadProgress(byteDownloadedUntilNow, speed))
         }
     }
 
