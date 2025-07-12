@@ -25,7 +25,8 @@ interface DownloadConnection {
 
 data class DownloadProgress(
     val byteDownloaded: Long = 0,
-    val speed: Double = 0.0
+    val speed: Double = 0.0,
+    val isFinished: Boolean = false,
 )
 
 class DownloadConnectionPool(val url: String) {

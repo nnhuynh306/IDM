@@ -6,10 +6,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.cancellable
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -136,17 +139,23 @@ data class DownloadTask(
     }
 }
 
-internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, val storage: Storage): NetworkTaskExecutor {
+internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, val storage: Storage)
+    : NetworkTaskExecutor, SpeedListener {
     private val tasks: ConcurrentLinkedQueue<DownloadTask> = ConcurrentLinkedQueue()
 
     private val downloadConnectionPool = DownloadConnectionPool(url = request.url)
 
     private val progressState = MutableStateFlow(DownloadProgress(0, 0.0))
 
+    private val speedMonitor = SpeedMonitor()
+
     private val totalByteDownloaded = LongAdder()
     private var totalByteNeedToDownload = 0L
 
     private val executorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    init {
+    }
 
     override fun execute(): Flow<DownloadProgress> {
         executeInBackground()
@@ -159,6 +168,8 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
     @Suppress("NewApi")
     private fun executeInBackground() {
         executorScope.launch {
+            speedMonitor.addListener(this@DynamicSegmentNetworkTaskExecutor)
+
             initialize()
 
             val jobs = arrayListOf<Deferred<*>>()
@@ -167,12 +178,21 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
                     pushTask(task)
                 })
             }
+
+            speedMonitor.startMonitoring()
         }
 
         executorScope.launch {
             progressState.collect {
                 if (it.byteDownloaded >= totalByteNeedToDownload && totalByteNeedToDownload != 0L) {
                     storage.finish();
+                    progressState.update { current ->
+                        DownloadProgress(
+                            current.byteDownloaded,
+                            current.speed,
+                            true
+                        )
+                    }
                 }
             }
         }
@@ -181,25 +201,20 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
     @Suppress("NewApi")
     suspend fun pushTask(task: DownloadTask) = coroutineScope {
         val connection = downloadConnectionPool.getConnectionFor(task)
-        launch(Dispatchers.Default) {
-            connection.getProgress()
-                .collect {
-                    progressState.update { currentProgress ->
-                        DownloadProgress(
-                            byteDownloaded = it.byteDownloaded + currentProgress.byteDownloaded,
-                            speed = it.speed
-                        )
-                    }
-                    if (it.speed >= currentSpeed.get() * 1.5) {
-                        currentSpeed.set(it.speed.toLong());
-                        _tryCreateNewTask()
-                    }
-                    println("test download speed task ${(it.speed / 1024 / 1024)}")
-                }
+        launch(Dispatchers.IO) {
+            connection.getProgress().collect {
+                speedMonitor.updateSpeedInfo(task.start, it.speed)
+            }
         }
         launch(Dispatchers.IO) {
             connection.execute(task).collect {
                 storage.savePartFile(byteArray = it.second, byteCount = it.first, task.getPartFileName(request.saveFileName))
+                progressState.update { progress ->
+                    DownloadProgress(
+                        byteDownloaded = progress.byteDownloaded + it.first,
+                        speed = speedMonitor.getCurrentSpeed().toDouble()
+                    )
+                }
             }
         }
     }
@@ -209,7 +224,6 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
         val headerRequestInfo = headerRequest.execute() ?: throw Exception("Null Header request")
 
         totalByteDownloaded.reset();
-
 
         totalByteNeedToDownload = headerRequestInfo.contentLength
 
@@ -248,6 +262,12 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
                     end = largestRemainTask.end,
                 ));
             }
+        }
+    }
+
+    override fun onTotalSpeedIncreased() {
+        executorScope.launch {
+            _tryCreateNewTask()
         }
     }
 }
