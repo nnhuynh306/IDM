@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -137,6 +139,16 @@ data class DownloadTask(
         }
         return fileName + "_" + start
     }
+
+    fun copyWith(newEnd: Long): DownloadTask {
+        return DownloadTask(
+            url,
+            start,
+            newEnd,
+            byteSaved,
+            byteDownloaded
+        )
+    }
 }
 
 internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, val storage: Storage)
@@ -233,34 +245,38 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
             end = headerRequestInfo.contentLength
         ))
     }
-
+    val mutex = Mutex()
     private suspend fun _tryCreateNewTask() {
-        var largestRemain: Long = -1
-        var largestRemainTask: DownloadTask? = null
-        for (task in tasks) {
-            val remain = task.end - task.start - task.byteDownloaded.toLong()
-            if (remain > largestRemain) {
-                largestRemain = remain
-                largestRemainTask = task
+        mutex.withLock {
+            var largestRemain: Long = -1
+            var largestRemainTask: DownloadTask? = null
+            for (task in tasks) {
+                val remain = task.end - task.start - task.byteDownloaded.toLong()
+                if (remain > largestRemain) {
+                    largestRemain = remain
+                    largestRemainTask = task
+                }
             }
-        }
 
-        if (largestRemainTask == null) {
-            return
-        }
+            if (largestRemainTask == null) {
+                return
+            }
 
-        val connection = downloadConnectionPool.findConnection(largestRemainTask) ?: return
+            val connection = downloadConnectionPool.findConnection(largestRemainTask) ?: return
 
-        val byteDownloaded = largestRemainTask.byteDownloaded.toLong()
-        val newEnd = largestRemainTask.start + byteDownloaded +
-                ((largestRemainTask.end - largestRemainTask.start - byteDownloaded) / 2)
-        if (connection.updateNewEnd(newEnd)) {
-            executorScope.launch {
-                pushTask(DownloadTask(
-                    url = largestRemainTask.url,
-                    start = newEnd + 1,
-                    end = largestRemainTask.end,
-                ));
+            val byteDownloaded = largestRemainTask.byteDownloaded.toLong()
+            val newEnd = largestRemainTask.start + byteDownloaded +
+                    ((largestRemainTask.end - largestRemainTask.start - byteDownloaded) / 2)
+            if (connection.updateNewEnd(newEnd)) {
+                tasks.remove(largestRemainTask)
+                tasks.add(largestRemainTask.copyWith(newEnd))
+                executorScope.launch {
+                    pushTask(DownloadTask(
+                        url = largestRemainTask.url,
+                        start = newEnd,
+                        end = largestRemainTask.end,
+                    ));
+                }
             }
         }
     }
