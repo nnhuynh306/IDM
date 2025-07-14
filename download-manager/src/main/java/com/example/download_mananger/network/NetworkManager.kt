@@ -127,7 +127,6 @@ data class DownloadTask(
     val url: String,
     val start: Long,
     val end: Long,
-    var byteSaved: Long = 0,
     val byteDownloaded: LongAdder = LongAdder(),
 ) {
 
@@ -145,7 +144,6 @@ data class DownloadTask(
             url,
             start,
             newEnd,
-            byteSaved,
             byteDownloaded
         )
     }
@@ -155,19 +153,18 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
     : NetworkTaskExecutor, SpeedListener {
     private val tasks: ConcurrentLinkedQueue<DownloadTask> = ConcurrentLinkedQueue()
 
-    private val downloadConnectionPool = DownloadConnectionPool(url = request.url)
-
     private val progressState = MutableStateFlow(DownloadProgress(0, 0.0))
 
-    private val speedMonitor = SpeedMonitor()
+    private val speedMonitorInterval = 1000L
+    private val speedMonitor = SpeedMonitor(speedMonitorInterval)
+
+    private val downloadConnectionPool = DownloadConnectionPool(url = request.url, speedMonitorInterval)
 
     private val totalByteDownloaded = LongAdder()
     private var totalByteNeedToDownload = 0L
 
     private val executorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    init {
-    }
 
     override fun execute(): Flow<DownloadProgress> {
         executeInBackground()
@@ -197,6 +194,7 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
         executorScope.launch {
             progressState.collect {
                 if (it.byteDownloaded >= totalByteNeedToDownload && totalByteNeedToDownload != 0L) {
+                    speedMonitor.stop()
                     storage.finish();
                     progressState.update { current ->
                         DownloadProgress(
@@ -268,8 +266,10 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
             val newEnd = largestRemainTask.start + byteDownloaded +
                     ((largestRemainTask.end - largestRemainTask.start - byteDownloaded) / 2)
             if (connection.updateNewEnd(newEnd)) {
-                tasks.remove(largestRemainTask)
-                tasks.add(largestRemainTask.copyWith(newEnd))
+                tasks.removeIf { it.start == largestRemainTask.start }
+                tasks.add(largestRemainTask.copyWith(
+                    newEnd
+                ))
                 executorScope.launch {
                     pushTask(DownloadTask(
                         url = largestRemainTask.url,

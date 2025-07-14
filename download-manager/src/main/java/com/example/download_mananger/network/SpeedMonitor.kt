@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.flow.toCollection
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentSkipListSet
 import java.util.concurrent.atomic.AtomicLong
 
 data class SpeedInfo(
@@ -22,7 +23,7 @@ interface SpeedListener {
     fun onTotalSpeedIncreased()
 }
 
-class SpeedMonitor {
+class SpeedMonitor(val interval: Long) {
     private val listSubscribers: ArrayList<SpeedListener> = arrayListOf()
 
     private val speedChannel = Channel<SpeedInfo>()
@@ -34,12 +35,15 @@ class SpeedMonitor {
 
     private var currentSpeed: AtomicLong = AtomicLong(0)
 
+    private var ids: ConcurrentSkipListSet<Long> = ConcurrentSkipListSet()
+    private var finishedIds: ConcurrentSkipListSet<Long> = ConcurrentSkipListSet()
+
     suspend fun startMonitoring() = coroutineScope {
         monitorJob = launch(speedChannelDispatcher) {
             val listSpeed: ArrayList<SpeedInfo> = arrayListOf()
             var highestSpeed = 0.0
             while (true) {
-                delay(1000);
+                delay(interval);
                 listSpeed.clear()
                 while (!speedChannel.isEmpty) {
                     val speedResult = speedChannel.receiveCatching()
@@ -47,7 +51,14 @@ class SpeedMonitor {
                 }
                 val currentSpeed = listSpeed.sumOf { it.speed }
                 this@SpeedMonitor.currentSpeed.set(currentSpeed.toLong())
-                if (currentSpeed > highestSpeed * 1.5) {
+
+                val averageSpeed = currentSpeed / ids.size
+                ids.removeAll(finishedIds)
+                finishedIds.clear()
+
+                println("total speed is ${currentSpeed / 1024 / 1024}")
+
+                if (currentSpeed >= highestSpeed + (averageSpeed * 0.5)) {
                     highestSpeed = currentSpeed
                     notifyListeners()
                 }
@@ -63,6 +74,7 @@ class SpeedMonitor {
 
 
     fun stop() {
+        println("Stopping speed monitor")
         monitorJob?.cancel()
         monitorJob = null
     }
@@ -80,7 +92,12 @@ class SpeedMonitor {
     }
 
     suspend fun updateSpeedInfo(objectId: Long, speed: Double) {
+        ids.add(objectId);
         speedChannel.send(SpeedInfo(objectId, speed));
+    }
+
+    fun setIdIsFinished(objectId: Long) {
+        finishedIds.add(objectId)
     }
 
     fun getCurrentSpeed(): Long {
