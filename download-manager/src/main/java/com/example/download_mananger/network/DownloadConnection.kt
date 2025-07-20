@@ -82,7 +82,7 @@ internal class DownloadConnectionImpl
         val rangeStart = task.start + task.byteSaved;
         val rangeEnd = task.end;
 
-        if (rangeEnd < rangeStart) {
+        if (rangeEnd <= rangeStart) {
             return@channelFlow
         }
 

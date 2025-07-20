@@ -38,7 +38,7 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
 
     private val downloadConnectionPool = DownloadConnectionPool(url = request.url, speedMonitorInterval)
 
-    private var totalByteNeedToDownload = 0L
+    private var totalByteNeedToDownload: Long? = null
 
     private val executorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -50,8 +50,15 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
 
         return combine(progressState.receiveAsFlow(), speedMonitor.getSpeedFlow()) { progress, speed ->
 
-            val byteDownloaded = progress.byteDownloaded.sumOf { it.progress.toLong() }
-            val isFinished = byteDownloaded >= totalByteNeedToDownload && totalByteNeedToDownload != 0L
+            val byteDownloaded = progress.byteDownloaded.toList().sumOf {
+                it.progress.toLong().let { totalProgress ->
+                    val task = tasks.find { task -> task.start == it.from }
+                    totalProgress.coerceAtMost(task?.let { it.end - it.start } ?: totalProgress)
+                }
+            }
+
+            val totalByteNeedToDownload = this.totalByteNeedToDownload
+            val isFinished = totalByteNeedToDownload != null && byteDownloaded >= totalByteNeedToDownload
             if (isFinished) {
                 speedMonitor.stop()
                 storage.mergeParts()
@@ -120,21 +127,15 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
                     headerRequestInfo.contentLength
                 }
 
-                val byteSaved = savedTask.byteSaved.coerceAtMost(end)
-
-                if (savedTask.start + byteSaved >= end) {
-                    continue
-                }
-
                 initTasks.add(DownloadTask(
                     url = request.url,
                     start = savedTask.start,
-                    byteSaved = byteSaved,
+                    byteSaved = savedTask.byteSaved,
                     end = end
                 ))
             }
 
-            totalByteNeedToDownload = initTasks.sumOf { it.end - it.start - it.byteSaved }
+            totalByteNeedToDownload = initTasks.sumOf { (it.end - it.start - it.byteSaved).coerceAtLeast(0) }
         } else {
             initTasks.add(DownloadTask(
                 url = request.url,
