@@ -1,34 +1,27 @@
 package com.example.download_mananger.network
 
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URI
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.LongAdder
+
+class ResponseCodeException(code: Int): Exception()
 
 interface DownloadConnection {
     suspend fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>>
     fun close()
     fun stop()
-    fun getStart(): Long
-    fun getProgress(): Flow<DownloadProgress>
-    suspend fun updateNewEnd(end: Long): Boolean
+    fun isRunning(task: DownloadTask): Boolean
+    fun updateEnd(end: Long)
 }
-
-data class DownloadProgress(
-    val byteDownloaded: Long = 0,
-    val speed: Double = 0.0,
-    val isFinished: Boolean = false,
-)
 
 class DownloadConnectionPool(val url: String, val speedMonitorInterval: Long) {
     val connections: ConcurrentLinkedQueue<DownloadConnection> = ConcurrentLinkedQueue()
@@ -41,7 +34,7 @@ class DownloadConnectionPool(val url: String, val speedMonitorInterval: Long) {
     fun findConnection(task: DownloadTask): DownloadConnection? {
         synchronized(connections) {
             for (connection in connections) {
-                if (connection.getStart() == task.start) {
+                if (connection.isRunning(task)) {
                     return connection
                 }
             }
@@ -51,7 +44,7 @@ class DownloadConnectionPool(val url: String, val speedMonitorInterval: Long) {
 
     fun addConnection(): DownloadConnection {
         synchronized(connectionCount) {
-            val newConnection = DownloadConnectionImpl(url, speedMonitorInterval)
+            val newConnection = DownloadConnectionImpl()
             connections.add(newConnection)
             connectionCount.add(1)
             return newConnection
@@ -69,135 +62,92 @@ class DownloadConnectionPool(val url: String, val speedMonitorInterval: Long) {
     }
 }
 
-internal class DownloadConnectionImpl(url: String, val speedMonitorInterval: Long)
-    : NetworkConnection(url), DownloadConnection {
-    private val byteDownloaded = LongAdder()
-
+internal class DownloadConnectionImpl
+    : NetworkConnection(), DownloadConnection {
     companion object {
         val pageSize = 8192
     }
+    val end: AtomicLong = AtomicLong(0)
+    val dispatcher = Dispatchers.IO.limitedParallelism(1)
 
-    private var end: AtomicLong = AtomicLong(0)
-    private var start: AtomicLong = AtomicLong(0)
-
-    private var monitorStart: Long = 0
-    private var monitorEnd: Long = 0
-
-    private var mutex = Mutex()
-
-    private var isFinished = AtomicBoolean(false)
+    var runningTask: DownloadTask? = null
 
     @OptIn(DelicateCoroutinesApi::class, ExperimentalCoroutinesApi::class)
     override suspend fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>> = channelFlow  {
-        println("start download from ${task.start} to ${task.end} with ${task.byteDownloaded.toLong()} bytes downloaded")
-        updateTask(task)
+        runningTask = task
+        end.set(task.end)
 
-        isFinished.set(false)
+        println("start download from ${task.start} to ${task.end} with ${task.byteSaved} bytes downloaded")
 
-        connection.connect()
+        val rangeStart = task.start + task.byteSaved;
+        val rangeEnd = task.end;
 
-        byteDownloaded.reset()
+        if (rangeEnd < rangeStart) {
+            return@channelFlow
+        }
 
-        println("response code of ${task.start} is ${connection.responseCode}")
+        val connection = openConnection(task.url)
 
-        if (connection.responseCode == HttpURLConnection.HTTP_PARTIAL) {
+        connection.setRequestProperty("Range", "bytes=$rangeStart-$rangeEnd")
+
+        launch(dispatcher) {
+            connection.connect()
+
+            println("response code of ${task.start} is ${connection.responseCode}")
+
+            var byteDownloaded: Long = task.byteSaved
+
+            if (connection.responseCode != HttpURLConnection.HTTP_PARTIAL) {
+                throw ResponseCodeException(connection.responseCode)
+            }
+
             val inputStream = connection.inputStream
-            monitorStart = System.currentTimeMillis()
             var byteRead: Int
             while (true) {
-                val remain =  end.get() - (byteDownloaded.toLong() + start.get())
+                val remain =  end.get() - (byteDownloaded + task.start)
                 val buffer = ByteArray(remain.coerceAtMost(pageSize.toLong()).toInt())
 
                 byteRead = inputStream.read(buffer)
 
-                val shouldBreak: Boolean
-                val remainBefore: Long
-                mutex.withLock {
-                    remainBefore = end.toLong() - (byteDownloaded.toLong() + start.toLong())
-                    if (byteRead > 0) {
-                        byteDownloaded.add(byteRead.toLong())
-                        task.byteDownloaded.add(byteRead.toLong())
-                    }
-                    shouldBreak = remainBefore <= 0 || byteRead <= 0
-                }
-                if (shouldBreak) {
+                if (byteRead <= 0) {
                     break
                 }
 
-                send(Pair(byteRead.toLong().coerceAtMost(remainBefore).toInt(), buffer))
+                val remainBefore: Long = end.get() - (byteDownloaded + task.start)
+                if (remainBefore <= 0) {
+                    break
+                }
+
+                val byteWillSend = byteRead.toLong().coerceAtMost(remainBefore).toInt()
+                byteDownloaded += byteWillSend
+
+                send(Pair(byteWillSend.toInt(), buffer))
             }
-            monitorEnd = System.currentTimeMillis()
-            isFinished.set(true)
             inputStream.close()
         }
     }
 
-    private fun updateTask(task: DownloadTask) {
-        start.set(task.start)
-        end.set(task.end)
-        connection.setRequestProperty("Range", "bytes=${task.start + task.byteDownloaded.toLong()}-${task.end}")
-    }
-
     override fun close() {
-        connection.disconnect()
+
     }
 
     override fun stop() {
-        connection.inputStream.close()
+
     }
 
-    override fun getStart(): Long {
-        return start.get()
+    override fun isRunning(task: DownloadTask): Boolean {
+        return runningTask?.equals(task) == true
     }
 
-    override fun getProgress(): Flow<DownloadProgress> = channelFlow {
-        var byteStart = 0L
-        while (true) {
-            if (monitorStart == 0L) {
-                delay(10L)
-                continue
-            } else {
-                delay(speedMonitorInterval)
-            }
-
-            val speed: Double
-            val byteDownloadedUntilNow: Long
-            synchronized(byteDownloaded) {
-                val startTime = monitorStart
-                monitorStart = System.currentTimeMillis()
-                byteDownloadedUntilNow = byteDownloaded.toLong()
-                val endTime = if (monitorEnd > 0) monitorEnd else System.currentTimeMillis()
-                speed = (byteDownloadedUntilNow - byteStart).toDouble() / ((endTime - startTime) / 1000.0)
-                byteStart = byteDownloadedUntilNow
-            }
-            val isFinished = isFinished.get()
-            send(DownloadProgress(byteDownloadedUntilNow, speed, isFinished))
-            if (isFinished) {
-                break
-            }
-        }
-    }
-
-    override suspend fun updateNewEnd(newEnd: Long): Boolean {
-        val result: Boolean
-        mutex.withLock {
-            if (byteDownloaded.toLong() > newEnd) {
-                println("new end updated failed of ${start.get()}: ${newEnd}")
-                result = false
-            } else {
-                end.set(newEnd)
-                println("new end updated successfully of ${start.get()}: ${newEnd}")
-                result = true
-            }
-        }
-        return result
+    override fun updateEnd(newEnd: Long) {
+        end.set(newEnd)
     }
 }
 
-abstract class NetworkConnection(val url: String) {
-    protected val connection: HttpURLConnection = URI(url).toURL().openConnection() as HttpURLConnection
-
-
+abstract class NetworkConnection {
+    fun openConnection(url: String): HttpURLConnection {
+         return URI(url).toURL().openConnection() as HttpURLConnection
+    }
 }
 
 data class RequestInfo(
@@ -205,9 +155,10 @@ data class RequestInfo(
     val acceptRange: Boolean,
 )
 
-class HeaderRequest(url: String): NetworkConnection(url) {
+class HeaderRequest(val url: String): NetworkConnection() {
 
     fun execute(): RequestInfo? {
+        val connection = openConnection(url)
         connection.requestMethod = "HEAD"
         connection.connectTimeout = 10000
         connection.connect()

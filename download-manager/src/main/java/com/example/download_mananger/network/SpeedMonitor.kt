@@ -3,16 +3,19 @@ package com.example.download_mananger.network
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.consume
-import kotlinx.coroutines.channels.toList
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.consumeAsFlow
-import kotlinx.coroutines.flow.toCollection
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ConcurrentSkipListSet
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.LongAccumulator
+import java.util.concurrent.atomic.LongAdder
+import java.util.function.LongBinaryOperator
 
 data class SpeedInfo(
     val objectId: Long,
@@ -24,41 +27,37 @@ interface SpeedListener {
 }
 
 class SpeedMonitor(val interval: Long) {
-    private val listSubscribers: ArrayList<SpeedListener> = arrayListOf()
+    private val listSubscribers: ConcurrentLinkedQueue<SpeedListener> = ConcurrentLinkedQueue()
 
-    private val speedChannel = Channel<SpeedInfo>()
-
-    private val subcriberDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val speedChannelDispatcher = Dispatchers.IO.limitedParallelism(1)
 
     private var monitorJob: Job? = null;
 
-    private var currentSpeed: AtomicLong = AtomicLong(0)
+    private var speedFlow: MutableStateFlow<Double> = MutableStateFlow(0.0)
 
-    private var ids: ConcurrentSkipListSet<Long> = ConcurrentSkipListSet()
-    private var finishedIds: ConcurrentSkipListSet<Long> = ConcurrentSkipListSet()
+    private var byteAccumulated = LongAdder()
 
-    suspend fun startMonitoring() = coroutineScope {
+    private var connectionCount = 0L
+
+    suspend fun startMonitoring(start: Long) = coroutineScope {
         monitorJob = launch(speedChannelDispatcher) {
-            val listSpeed: ArrayList<SpeedInfo> = arrayListOf()
             var highestSpeed = 0.0
+            var startTime = start
             while (true) {
-                delay(interval);
-                listSpeed.clear()
-                while (!speedChannel.isEmpty) {
-                    val speedResult = speedChannel.receiveCatching()
-                    listSpeed.add(speedResult.getOrThrow())
-                }
-                val currentSpeed = listSpeed.sumOf { it.speed }
-                this@SpeedMonitor.currentSpeed.set(currentSpeed.toLong())
+                delay(interval)
 
-                val averageSpeed = currentSpeed / ids.size
-                ids.removeAll(finishedIds)
-                finishedIds.clear()
+                val endTime = System.currentTimeMillis()
+                val currentSpeed = byteAccumulated.toDouble() / ((endTime - startTime) / 1000.0)
+                startTime = endTime
+                byteAccumulated.reset()
 
-                println("total speed is ${currentSpeed / 1024 / 1024}")
+                this@SpeedMonitor.speedFlow.update { currentSpeed }
 
-                if (currentSpeed >= highestSpeed + (averageSpeed * 0.5)) {
+                val averageSpeed = currentSpeed / connectionCount
+
+                println("speed: ${currentSpeed.toLong()}" )
+
+                if (currentSpeed >= highestSpeed + (averageSpeed * 0.7)) {
                     highestSpeed = currentSpeed
                     notifyListeners()
                 }
@@ -79,28 +78,31 @@ class SpeedMonitor(val interval: Long) {
         monitorJob = null
     }
 
-    suspend fun addListener(listener: SpeedListener) {
-        withContext(subcriberDispatcher) {
-            listSubscribers.add(listener)
+    fun addListener(listener: SpeedListener) {
+        listSubscribers.add(listener)
+    }
+
+    fun removeListener(listener: SpeedListener) {
+        listSubscribers.remove(listener)
+    }
+
+    fun addByteCount(byteCount: Long) {
+        byteAccumulated.add(byteCount)
+    }
+
+    suspend fun addConnectionCount() {
+        withContext(speedChannelDispatcher) {
+            connectionCount += 1
         }
     }
 
-    suspend fun removeListener(listener: SpeedListener) {
-        withContext(subcriberDispatcher) {
-            listSubscribers.remove(listener)
+    suspend fun reduceConnectionCount() {
+        withContext(speedChannelDispatcher) {
+            connectionCount = (connectionCount - 1).coerceAtLeast(0)
         }
     }
 
-    suspend fun updateSpeedInfo(objectId: Long, speed: Double) {
-        ids.add(objectId);
-        speedChannel.send(SpeedInfo(objectId, speed));
-    }
-
-    fun setIdIsFinished(objectId: Long) {
-        finishedIds.add(objectId)
-    }
-
-    fun getCurrentSpeed(): Long {
-        return currentSpeed.get();
+    fun getSpeedFlow(): Flow<Double> {
+        return speedFlow
     }
 }
