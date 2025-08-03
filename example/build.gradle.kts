@@ -13,6 +13,6 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":download-manager"))
+    implementation(project(":download-executor"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
 }

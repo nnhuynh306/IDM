@@ -1,6 +1,5 @@
-package com.example.idm.ui.theme
+package com.example.idm.core.design.theme
 
-import android.app.Activity
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme

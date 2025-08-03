@@ -1,8 +1,7 @@
-package com.example.download_mananger.network
+package com.example.downloadexecutor
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -11,11 +10,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.ConcurrentSkipListSet
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.LongAccumulator
 import java.util.concurrent.atomic.LongAdder
-import java.util.function.LongBinaryOperator
 
 data class SpeedInfo(
     val objectId: Long,
@@ -53,11 +48,15 @@ class SpeedMonitor(val interval: Long) {
 
                 this@SpeedMonitor.speedFlow.update { currentSpeed }
 
-                val averageSpeed = currentSpeed / connectionCount
+                val averageSpeed = if (connectionCount > 0) {
+                    currentSpeed / connectionCount
+                } else {
+                    0.0
+                }
 
-                println("speed: ${currentSpeed.toLong()}" )
+                println("speed: ${currentSpeed.toLong()} / average speed: ${averageSpeed}" )
 
-                if (currentSpeed >= highestSpeed + (averageSpeed * 0.7)) {
+                if (currentSpeed > highestSpeed + (averageSpeed * 0.7)) {
                     highestSpeed = currentSpeed
                     notifyListeners()
                 }

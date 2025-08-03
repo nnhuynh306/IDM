@@ -1,4 +1,4 @@
-package com.example.download_mananger.network
+package com.example.downloadexecutor
 
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
@@ -6,7 +6,6 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URI
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -15,15 +14,14 @@ import java.util.concurrent.atomic.LongAdder
 
 class ResponseCodeException(code: Int): Exception()
 
-interface DownloadConnection {
+internal interface DownloadConnection {
     suspend fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>>
-    fun close()
     fun stop()
     fun isRunning(task: DownloadTask): Boolean
     fun updateEnd(end: Long)
 }
 
-class DownloadConnectionPool(val url: String, val speedMonitorInterval: Long) {
+internal class DownloadConnectionPool(val url: String, val speedMonitorInterval: Long) {
     val connections: ConcurrentLinkedQueue<DownloadConnection> = ConcurrentLinkedQueue()
     var connectionCount: LongAdder = LongAdder()
 
@@ -57,7 +55,7 @@ class DownloadConnectionPool(val url: String, val speedMonitorInterval: Long) {
 
     fun cleanUp() {
         while (connections.isNotEmpty()) {
-            connections.remove().close()
+            connections.remove().stop()
         }
     }
 }
@@ -71,6 +69,8 @@ internal class DownloadConnectionImpl
     val dispatcher = Dispatchers.IO.limitedParallelism(1)
 
     var runningTask: DownloadTask? = null
+
+    var isStopped = false;
 
     @OptIn(DelicateCoroutinesApi::class, ExperimentalCoroutinesApi::class)
     override suspend fun execute(task: DownloadTask): Flow<Pair<Int, ByteArray>> = channelFlow  {
@@ -97,13 +97,14 @@ internal class DownloadConnectionImpl
 
             var byteDownloaded: Long = task.byteSaved
 
-            if (connection.responseCode != HttpURLConnection.HTTP_PARTIAL) {
+            if (connection.responseCode != HttpURLConnection.HTTP_PARTIAL
+                && connection.responseCode != HttpURLConnection.HTTP_OK) {
                 throw ResponseCodeException(connection.responseCode)
             }
 
             val inputStream = connection.inputStream
             var byteRead: Int
-            while (true) {
+            while (!isStopped) {
                 val remain =  end.get() - (byteDownloaded + task.start)
                 val buffer = ByteArray(remain.coerceAtMost(pageSize.toLong()).toInt())
 
@@ -127,12 +128,8 @@ internal class DownloadConnectionImpl
         }
     }
 
-    override fun close() {
-
-    }
-
     override fun stop() {
-
+        isStopped = true
     }
 
     override fun isRunning(task: DownloadTask): Boolean {
@@ -144,29 +141,30 @@ internal class DownloadConnectionImpl
     }
 }
 
-abstract class NetworkConnection {
+internal abstract class NetworkConnection {
     fun openConnection(url: String): HttpURLConnection {
          return URI(url).toURL().openConnection() as HttpURLConnection
     }
 }
 
-data class RequestInfo(
+data class HeaderRequestInfo(
     val contentLength: Long,
     val acceptRange: Boolean,
+    val fileName: String? = null,
 )
 
-class HeaderRequest(val url: String): NetworkConnection() {
+internal class HeaderRequest(val url: String): NetworkConnection() {
 
-    fun execute(): RequestInfo? {
+    fun execute(): HeaderRequestInfo? {
         val connection = openConnection(url)
-        connection.requestMethod = "HEAD"
+        connection.requestMethod = "GET"
         connection.connectTimeout = 10000
         connection.connect()
 
         return if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-            return RequestInfo(
+            return HeaderRequestInfo(
                 contentLength = connection.getHeaderField("Content-Length").toLong(),
-                acceptRange = connection.getHeaderField("Accept-Ranges").lowercase() == "true"
+                acceptRange = connection.getHeaderField("Accept-Ranges")?.lowercase() == "true"
             )
         } else {
             null

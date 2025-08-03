@@ -1,6 +1,5 @@
-package com.example.download_mananger.storage
+package com.example.downloadexecutor
 
-import com.example.download_mananger.network.DownloadTask
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -10,16 +9,18 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 
-fun getStorageFor(path: String): Storage {
-    return StorageImpl(path)
-}
-
 private fun String.isPartFile(): Boolean {
     return length > 5 && substring(length - 5, length) == ".part"
 }
 
 private fun String.getNameWithoutExtension(): String {
     return substring(0, lastIndexOf("."))
+}
+
+data class InternalDirectory(
+    val destination: String,
+): File(destination.getNameWithoutExtension()) {
+
 }
 
 data class SavedRequestInfo(
@@ -32,30 +33,28 @@ data class SavedTask(
     val byteSaved: Long
 )
 
-interface Storage {
+interface SaveFileHandler {
     suspend fun saveToPartFile(task: DownloadTask, byteArray: ByteArray, byteCount: Int, onFinish: suspend () -> Unit)
     suspend fun getSavedRequestInfo(): SavedRequestInfo?
     suspend fun mergeParts()
 }
 
-internal class StorageImpl(val destination: String): Storage {
-    val directory: File
+internal class SaveFileHandlerImpl(val destination: String): SaveFileHandler {
+    val partFileContainer: InternalDirectory = InternalDirectory(destination)
 
     val saverMap = ConcurrentHashMap<String, PartFileSaver>()
 
     init {
-        val directoryFolderPath = destination.getNameWithoutExtension()
-        directory = File(directoryFolderPath)
-        directory.mkdirs()
+        partFileContainer.mkdirs()
     }
 
     override suspend fun getSavedRequestInfo(): SavedRequestInfo? {
-        if (!directory.exists()) {
+        if (!partFileContainer.exists()) {
             return null
         }
 
         return SavedRequestInfo(
-            savedTasks = directory.listFiles()
+            savedTasks = partFileContainer.listFiles()
                 .filter {
                     it.name.isPartFile()
                 }.map {
@@ -77,13 +76,14 @@ internal class StorageImpl(val destination: String): Storage {
         onFinish: suspend () -> Unit,
     ) {
         val saver = saverMap.getOrPut(task.id) {
-            PartFileSaver(task, directory.path)
+            PartFileSaver(task, partFileContainer.path)
         }
 
         saver?.appendByte(byteCount, byteArray, onFinish)
     }
 
     override suspend fun mergeParts() {
+        println("merge parts")
         withContext(Dispatchers.IO) {
             for (saver in saverMap.values) {
                 saver.close()
@@ -91,7 +91,7 @@ internal class StorageImpl(val destination: String): Storage {
             val destinationFile = File(destination)
             val buffer = ByteArray(8192)
             FileOutputStream(destinationFile, false).use { desFos ->
-                val partFiles = directory.listFiles().filter {
+                val partFiles = partFileContainer.listFiles().filter {
                     it.name.isPartFile()
                 }.toList().sortedBy {
                     it.name.getNameWithoutExtension().toInt()
@@ -129,7 +129,7 @@ internal class StorageImpl(val destination: String): Storage {
                     file.delete()
                 }
             }
-            directory.delete()
+            partFileContainer.delete()
         }
     }
 
@@ -137,20 +137,28 @@ internal class StorageImpl(val destination: String): Storage {
 
 internal class PartFileSaver(task: DownloadTask, directory: String) {
     private val filePath = "$directory/${task.start}.part"
-    private val outputStream: FileOutputStream = FileOutputStream(filePath, true)
+    private var outputStream: FileOutputStream? = null
     private val dispatcher = Dispatchers.IO.limitedParallelism(1)
     private val scope = CoroutineScope(dispatcher)
     private var byteSaved = 0L
 
+    init {
+        try {
+            outputStream = FileOutputStream(filePath, true)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     fun appendByte(byteCount: Int, byteArray: ByteArray, onFinish: suspend () -> Unit) {
         scope.launch {
             byteSaved += byteCount
-            outputStream.write(byteArray, 0, byteCount)
+            outputStream?.write(byteArray, 0, byteCount)
             onFinish()
         }
     }
 
     fun close() {
-        outputStream.close()
+        outputStream?.close()
     }
 }

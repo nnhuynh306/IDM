@@ -21,5 +21,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "IDM"
 include(":app")
-include(":download-manager")
+include(":download-executor")
 include(":example")

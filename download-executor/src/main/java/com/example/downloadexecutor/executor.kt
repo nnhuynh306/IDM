@@ -1,37 +1,46 @@
-package com.example.download_mananger.network
+package com.example.downloadexecutor
 
-import com.example.download_mananger.storage.Storage
-import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.consume
-import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.LongAdder
 
-internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, val storage: Storage)
+interface NetworkTaskExecutor {
+    fun start(): Flow<DownloadProgress>
+    fun stop()
+}
+
+internal enum class ExecutorStatus {
+    START,
+    STOP,
+    END
+}
+
+internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
+                                                 val saveFileHandler: SaveFileHandler)
     : NetworkTaskExecutor, SpeedListener {
     private val tasks: ConcurrentLinkedQueue<DownloadTask> = ConcurrentLinkedQueue()
 
-    private val progressState = Channel<DownloadProgress>(
+    private val progressState = Channel<InternalDownloadProgress>(
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 
-    private val progress = DownloadProgress(arrayListOf())
+    private val progress = InternalDownloadProgress(arrayListOf())
 
     private val speedMonitorInterval = 1000L
     private val speedMonitor = SpeedMonitor(speedMonitorInterval)
@@ -44,11 +53,35 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
 
     private val byteDownloadedMap: ConcurrentHashMap<String, LongAdder> = ConcurrentHashMap()
 
+    private val statusFlow = MutableStateFlow(ExecutorStatus.START)
 
-    override fun execute(): Flow<DownloadProcessInfo> {
+    private var rangeEnabled = true;
+
+    private var isFinalized = false
+    private var finalizedLock = Object()
+
+    override fun start(): Flow<DownloadProgress> {
         executeInBackground()
 
-        return combine(progressState.receiveAsFlow(), speedMonitor.getSpeedFlow()) { progress, speed ->
+        return combine(progressState.receiveAsFlow(), speedMonitor.getSpeedFlow(), statusFlow)
+        { progress, speed, status ->
+
+            if (status == ExecutorStatus.STOP) {
+                internalStop()
+                return@combine DownloadProgress(
+                    progress.byteDownloaded,
+                    speed = speed,
+                    status = DownloadProgress.Status.PAUSED
+                )
+            }
+
+            if (status == ExecutorStatus.END) {
+                return@combine DownloadProgress(
+                    progress.byteDownloaded,
+                    speed = speed,
+                    status = DownloadProgress.Status.FINISHED
+                )
+            }
 
             val byteDownloaded = progress.byteDownloaded.toList().sumOf {
                 it.progress.toLong().let { totalProgress ->
@@ -58,23 +91,62 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
             }
 
             val totalByteNeedToDownload = this.totalByteNeedToDownload
-            val isFinished = totalByteNeedToDownload != null && byteDownloaded >= totalByteNeedToDownload
-            if (isFinished) {
-                speedMonitor.stop()
-                storage.mergeParts()
+            val needFinalizing = totalByteNeedToDownload != null && byteDownloaded >= totalByteNeedToDownload
+            val status = if (needFinalizing) {
+                finalize()
+                DownloadProgress.Status.FINALIZING
+            } else {
+                DownloadProgress.Status.DOWNLOADING
             }
 
-            DownloadProcessInfo(
+            DownloadProgress(
                 progress.byteDownloaded,
                 speed = speed,
-                isFinished = isFinished
+                status = status
             )
         }
     }
 
+    private fun finalize(): Boolean {
+        val canFinalize: Boolean
+        synchronized(finalizedLock) {
+            canFinalize = !isFinalized
+            if (!isFinalized) {
+                isFinalized = true
+            }
+        }
+        executorScope.launch {
+            if (canFinalize) {
+                saveFileHandler.mergeParts()
+                internalStop()
+                statusFlow.update {
+                    ExecutorStatus.END
+                }
+            }
+        }
+        return canFinalize
+    }
+
+    private fun internalStop() {
+        downloadConnectionPool.cleanUp()
+        speedMonitor.stop()
+        progressState.close()
+        executorScope.cancel()
+    }
+
+    override fun stop() {
+        statusFlow.update { ExecutorStatus.STOP }
+    }
+
     @Suppress("NewApi")
     private fun executeInBackground() {
-        executorScope.launch {
+        val handler = CoroutineExceptionHandler { _, exception ->
+            println("Caught exception: $exception")
+            exception.printStackTrace()
+            stop()
+        }
+
+        executorScope.launch(handler) {
             speedMonitor.addListener(this@DynamicSegmentNetworkTaskExecutor)
 
             launch {
@@ -103,8 +175,10 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
                 val byteArray = it.second
                 speedMonitor.addByteCount(byteCount.toLong())
                 byteDownloaded.add(byteCount.toLong())
-                storage.saveToPartFile(task = task, byteArray = byteArray, byteCount = byteCount) {
-                    progressState.send(progress.updateWith(task, byteCount))
+                saveFileHandler.saveToPartFile(task = task, byteArray = byteArray, byteCount = byteCount) {
+                    if (!progressState.isClosedForSend) {
+                        progressState.send(progress.updateWith(task, byteCount))
+                    }
                 }
             }
             speedMonitor.reduceConnectionCount()
@@ -114,8 +188,9 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
     private suspend fun initialize() = coroutineScope {
         val headerRequest = HeaderRequest(request.url)
         val headerRequestInfo = headerRequest.execute() ?: throw Exception("Null Header request")
+//        rangeEnabled = headerRequestInfo.acceptRange
 
-        val savedRequestInfo = storage.getSavedRequestInfo()
+        val savedRequestInfo = saveFileHandler.getSavedRequestInfo()
 
         val initTasks: ArrayList<DownloadTask> = arrayListOf()
 
@@ -146,14 +221,27 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest, v
             totalByteNeedToDownload = headerRequestInfo.contentLength
         }
 
-        for (task in initTasks) {
-            launch {
-                pushTask(task)
+        if (totalByteNeedToDownload == 0L) {
+            if (savedRequestInfo != null) {
+                val finalProgress = InternalPartialProgress(0)
+                finalProgress.progress.add(headerRequestInfo.contentLength)
+                progressState.send(InternalDownloadProgress(
+                    arrayListOf(finalProgress)
+                ))
+            }
+        } else {
+            for (task in initTasks) {
+                launch {
+                    pushTask(task)
+                }
             }
         }
     }
 
     private fun tryCreateNewTask() {
+        if (!rangeEnabled) {
+            return
+        }
         var largestRemain: Long = -1
         var largestRemainTask: DownloadTask? = null
         var largestByteDownloaded: LongAdder? = null

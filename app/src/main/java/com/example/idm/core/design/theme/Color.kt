@@ -1,4 +1,4 @@
-package com.example.idm.ui.theme
+package com.example.idm.core.design.theme
 
 import androidx.compose.ui.graphics.Color
 
