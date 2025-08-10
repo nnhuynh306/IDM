@@ -37,6 +37,7 @@ class SpeedMonitor(val interval: Long) {
     suspend fun startMonitoring(start: Long) = coroutineScope {
         monitorJob = launch(speedChannelDispatcher) {
             var highestSpeed = 0.0
+            var firstConnectionSpeedIsStable = false
             var startTime = start
             while (true) {
                 delay(interval)
@@ -55,6 +56,15 @@ class SpeedMonitor(val interval: Long) {
                 }
 
                 println("speed: ${currentSpeed.toLong()} / average speed: ${averageSpeed}" )
+                if (!firstConnectionSpeedIsStable) {
+                    if (currentSpeed < highestSpeed) {
+                        firstConnectionSpeedIsStable = true
+                        notifyListeners()
+                    } else {
+                        highestSpeed = currentSpeed
+                    }
+                    continue
+                }
 
                 if (currentSpeed > highestSpeed + (averageSpeed * 0.7)) {
                     highestSpeed = currentSpeed

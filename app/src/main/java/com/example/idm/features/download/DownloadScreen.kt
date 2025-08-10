@@ -207,7 +207,7 @@ fun FileItem(
                     onClick = onButtonClick
                 ) {
                     when(status) {
-                        is Status.NotStarted, is Status.Paused -> {
+                        is Status.NotStarted, is Status.Paused, is Status.Error -> {
                             Icon(
                                 imageVector = Icons.Rounded.PlayCircleOutline,
                                 contentDescription = "",
@@ -255,7 +255,16 @@ fun StatusView(status: Status, totalFileSize: Long) {
                 Status.Finalizing -> "Finalizing"
                 Status.NotStarted -> ""
                 is Status.Paused -> "Paused"
-            }
+                is Status.Error -> {
+                    "Error: ${status.error.message}"
+                }
+            },
+            color = if (status is Status.Error) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.typography.bodyMedium.color
+            },
+            maxLines = 3
         )
 
         if (status is Status.ProgressStatus) {

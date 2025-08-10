@@ -14,6 +14,7 @@ sealed interface Status {
     object NotStarted: Status
     object Finished: Status
     object Finalizing: Status
+    data class Error(val error: Throwable): Status
 
     abstract class ProgressStatus(data: List<PartProgress>) {
         val progress: List<PartProgress> = data.sortedBy { it.from }

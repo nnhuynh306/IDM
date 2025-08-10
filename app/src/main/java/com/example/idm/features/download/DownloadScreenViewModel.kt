@@ -96,7 +96,7 @@ class DownloadScreenViewModel @Inject constructor(
                     fileRepository.remove(fileInfo)
                 }
             }
-            Status.NotStarted, is Status.Paused -> {
+            Status.NotStarted, is Status.Paused, is Status.Error -> {
                 startOrResume(fileInfo)
             }
         }

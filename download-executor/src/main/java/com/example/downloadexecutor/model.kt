@@ -59,6 +59,7 @@ data class InternalPartialProgress(
 data class DownloadRequest(
     val url: String,
     val saveFileName: String,
+    val startThreadCount: Int = 1
 )
 
 @Suppress("NewApi")
@@ -68,6 +69,7 @@ data class DownloadTask @OptIn(ExperimentalUuidApi::class) constructor(
     val start: Long,
     val end: Long,
     val byteSaved: Long,
+    val useRangeRequest: Boolean = false
 ) {
     fun equals(otherTask: DownloadTask): Boolean {
         return otherTask.id == id
@@ -79,7 +81,8 @@ data class DownloadTask @OptIn(ExperimentalUuidApi::class) constructor(
             url,
             start,
             newEnd,
-            byteSaved
+            byteSaved,
+            useRangeRequest
         )
     }
 }

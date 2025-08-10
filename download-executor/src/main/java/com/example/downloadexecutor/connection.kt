@@ -6,6 +6,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URI
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -90,15 +91,16 @@ internal class DownloadConnectionImpl
 
         connection.setRequestProperty("Range", "bytes=$rangeStart-$rangeEnd")
 
-        launch(dispatcher) {
+        withContext(dispatcher) {
             connection.connect()
 
             println("response code of ${task.start} is ${connection.responseCode}")
 
             var byteDownloaded: Long = task.byteSaved
 
-            if (connection.responseCode != HttpURLConnection.HTTP_PARTIAL
-                && connection.responseCode != HttpURLConnection.HTTP_OK) {
+            if ((connection.responseCode != HttpURLConnection.HTTP_PARTIAL && task.useRangeRequest)
+                && connection.responseCode != HttpURLConnection.HTTP_OK
+            ) {
                 throw ResponseCodeException(connection.responseCode)
             }
 
@@ -156,17 +158,25 @@ data class HeaderRequestInfo(
 internal class HeaderRequest(val url: String): NetworkConnection() {
 
     fun execute(): HeaderRequestInfo? {
-        val connection = openConnection(url)
-        connection.requestMethod = "GET"
-        connection.connectTimeout = 10000
-        connection.connect()
+        return tryWithMethod("HEAD") ?: tryWithMethod("GET")
+    }
 
-        return if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-            return HeaderRequestInfo(
-                contentLength = connection.getHeaderField("Content-Length").toLong(),
-                acceptRange = connection.getHeaderField("Accept-Ranges")?.lowercase() == "true"
-            )
-        } else {
+    private fun tryWithMethod(method: String): HeaderRequestInfo? {
+        return try {
+            val connection = openConnection(url)
+            connection.requestMethod = method
+            connection.connectTimeout = 5000
+            connection.connect()
+
+            if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+                HeaderRequestInfo(
+                    contentLength = connection.getHeaderField("Content-Length").toLong(),
+                    acceptRange = connection.getHeaderField("Accept-Ranges") != null
+                )
+            } else {
+                null
+            }
+        } catch (ex: Exception) {
             null
         }
     }

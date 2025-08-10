@@ -13,7 +13,7 @@ fun createManager(): DownloadManager {
 
 interface DownloadManager {
     suspend fun getSavedProgressOf(request: DownloadRequest): SavedProgress?
-    fun download(request: DownloadRequest): Flow<DownloadProgress>
+    fun download(request: DownloadRequest): Flow<Result<DownloadProgress>>
     fun stop(request: DownloadRequest)
     suspend fun getHeaderInfo(url: String): HeaderRequestInfo
 }
@@ -68,7 +68,7 @@ internal class DownloadManagerImpl: DownloadManager {
         }
     }
 
-    override fun download(request: DownloadRequest): Flow<DownloadProgress> {
+    override fun download(request: DownloadRequest): Flow<Result<DownloadProgress>> {
         return getExecutor(request).start()
     }
 

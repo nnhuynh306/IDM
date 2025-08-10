@@ -22,6 +22,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onEmpty
 import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.takeWhile
+import kotlinx.coroutines.flow.transformWhile
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -83,41 +85,47 @@ class FileRepositoryImpl @Inject constructor(
 
     override suspend fun startOrResumeRequest(url: String, destination: String) {
         val statusState = getCurrentStatusOf(url = url, destination = destination)
-        try {
-            downloadManager.download(DownloadRequest(
-                url = url,
-                saveFileName = destination
-            )).collect {
-                statusState.update { currentState ->
-                    when(it.status) {
-                        DownloadProgress.Status.DOWNLOADING -> {
-                            Status.Downloading(progress = it.byteDownloaded.map { progress ->
-                                PartProgress(
-                                    from = progress.from,
-                                    to = progress.from + progress.progress.toLong()
-                                )
-                            }.toList(), speed = it.speed)
-                        }
-                        DownloadProgress.Status.PAUSED -> {
-                            Status.Paused(progress = it.byteDownloaded.map { progress ->
-                                PartProgress(
-                                    from = progress.from,
-                                    to = progress.from + progress.progress.toLong()
-                                )
-                            }.toList())
-                        }
-                        DownloadProgress.Status.FINALIZING -> {
-                            Status.Finalizing
-                        }
-                        DownloadProgress.Status.FINISHED -> {
-                            Status.Finished
+        downloadManager.download(DownloadRequest(
+            url = url,
+            saveFileName = destination
+        ))
+            .transformWhile {
+                emit(it)
+                it.isSuccess
+            }
+            .collect {
+                if (it.isSuccess) {
+                    val progressResult = it.getOrThrow()
+                    statusState.update { currentState ->
+                        when(progressResult.status) {
+                            DownloadProgress.Status.DOWNLOADING -> {
+                                Status.Downloading(progress = progressResult.byteDownloaded.map { progress ->
+                                    PartProgress(
+                                        from = progress.from,
+                                        to = progress.from + progress.progress.toLong()
+                                    )
+                                }.toList(), speed = progressResult.speed)
+                            }
+                            DownloadProgress.Status.PAUSED -> {
+                                Status.Paused(progress = progressResult.byteDownloaded.map { progress ->
+                                    PartProgress(
+                                        from = progress.from,
+                                        to = progress.from + progress.progress.toLong()
+                                    )
+                                }.toList())
+                            }
+                            DownloadProgress.Status.FINALIZING -> {
+                                Status.Finalizing
+                            }
+                            DownloadProgress.Status.FINISHED -> {
+                                Status.Finished
+                            }
                         }
                     }
+                } else {
+                    Status.Error(it.exceptionOrNull()!!)
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
     }
 
     override fun pauseRequest(url: String, destination: String) {

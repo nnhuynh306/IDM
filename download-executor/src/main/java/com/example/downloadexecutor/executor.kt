@@ -21,14 +21,15 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.LongAdder
 
 interface NetworkTaskExecutor {
-    fun start(): Flow<DownloadProgress>
+    fun start(): Flow<Result<DownloadProgress>>
     fun stop()
 }
 
-internal enum class ExecutorStatus {
-    START,
-    STOP,
-    END
+internal sealed interface ExecutorStatus {
+    object Start: ExecutorStatus
+    object Stop: ExecutorStatus
+    object End: ExecutorStatus
+    class Error(val exception: Throwable): ExecutorStatus
 }
 
 internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
@@ -53,34 +54,49 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
 
     private val byteDownloadedMap: ConcurrentHashMap<String, LongAdder> = ConcurrentHashMap()
 
-    private val statusFlow = MutableStateFlow(ExecutorStatus.START)
+    private val statusFlow: MutableStateFlow<ExecutorStatus> = MutableStateFlow(ExecutorStatus.Start)
 
     private var rangeEnabled = true;
 
     private var isFinalized = false
     private var finalizedLock = Object()
 
-    override fun start(): Flow<DownloadProgress> {
+    private val scopeErrorHandler = CoroutineExceptionHandler { _, exception ->
+        sendStopOnException(exception)
+    }
+
+    private fun sendStopOnException(exception: Throwable) {
+        statusFlow.update {
+            ExecutorStatus.Error(exception)
+        }
+    }
+
+    override fun start(): Flow<Result<DownloadProgress>> {
         executeInBackground()
 
         return combine(progressState.receiveAsFlow(), speedMonitor.getSpeedFlow(), statusFlow)
         { progress, speed, status ->
 
-            if (status == ExecutorStatus.STOP) {
+            if (status is ExecutorStatus.Error) {
                 internalStop()
-                return@combine DownloadProgress(
+                return@combine Result.failure(status.exception)
+            }
+
+            if (status is ExecutorStatus.Stop) {
+                internalStop()
+                return@combine Result.success(DownloadProgress(
                     progress.byteDownloaded,
                     speed = speed,
                     status = DownloadProgress.Status.PAUSED
-                )
+                ))
             }
 
-            if (status == ExecutorStatus.END) {
-                return@combine DownloadProgress(
+            if (status is ExecutorStatus.End) {
+                return@combine Result.success(DownloadProgress(
                     progress.byteDownloaded,
                     speed = speed,
                     status = DownloadProgress.Status.FINISHED
-                )
+                ))
             }
 
             val byteDownloaded = progress.byteDownloaded.toList().sumOf {
@@ -92,18 +108,18 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
 
             val totalByteNeedToDownload = this.totalByteNeedToDownload
             val needFinalizing = totalByteNeedToDownload != null && byteDownloaded >= totalByteNeedToDownload
-            val status = if (needFinalizing) {
+            val downloadStatus = if (needFinalizing) {
                 finalize()
                 DownloadProgress.Status.FINALIZING
             } else {
                 DownloadProgress.Status.DOWNLOADING
             }
 
-            DownloadProgress(
+            return@combine Result.success(DownloadProgress(
                 progress.byteDownloaded,
                 speed = speed,
-                status = status
-            )
+                status = downloadStatus
+            ))
         }
     }
 
@@ -115,12 +131,12 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
                 isFinalized = true
             }
         }
-        executorScope.launch {
+        executorScope.launch(scopeErrorHandler) {
             if (canFinalize) {
                 saveFileHandler.mergeParts()
                 internalStop()
                 statusFlow.update {
-                    ExecutorStatus.END
+                    ExecutorStatus.End
                 }
             }
         }
@@ -135,21 +151,17 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
     }
 
     override fun stop() {
-        statusFlow.update { ExecutorStatus.STOP }
+        statusFlow.update { ExecutorStatus.Stop }
     }
 
     @Suppress("NewApi")
     private fun executeInBackground() {
-        val handler = CoroutineExceptionHandler { _, exception ->
-            println("Caught exception: $exception")
-            exception.printStackTrace()
-            stop()
-        }
+        executorScope.launch(scopeErrorHandler) {
+            progressState.send(progress)
 
-        executorScope.launch(handler) {
             speedMonitor.addListener(this@DynamicSegmentNetworkTaskExecutor)
 
-            launch {
+            launch(scopeErrorHandler) {
                 val start = System.currentTimeMillis()
                 delay(1000)
                 speedMonitor.startMonitoring(start)
@@ -170,16 +182,21 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
 
         val connection = downloadConnectionPool.getConnectionFor(task)
         withContext(Dispatchers.IO) {
-            connection.execute(task).collect {
-                val byteCount = it.first
-                val byteArray = it.second
-                speedMonitor.addByteCount(byteCount.toLong())
-                byteDownloaded.add(byteCount.toLong())
-                saveFileHandler.saveToPartFile(task = task, byteArray = byteArray, byteCount = byteCount) {
-                    if (!progressState.isClosedForSend) {
-                        progressState.send(progress.updateWith(task, byteCount))
+            try {
+                connection.execute(task).collect {
+                    val byteCount = it.first
+                    val byteArray = it.second
+                    speedMonitor.addByteCount(byteCount.toLong())
+                    byteDownloaded.add(byteCount.toLong())
+                    saveFileHandler.saveToPartFile(task = task, byteArray = byteArray, byteCount = byteCount) {
+                        if (!progressState.isClosedForSend) {
+                            progressState.send(progress.updateWith(task, byteCount))
+                        }
                     }
                 }
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+                sendStopOnException(ex)
             }
             speedMonitor.reduceConnectionCount()
         }
@@ -188,12 +205,13 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
     private suspend fun initialize() = coroutineScope {
         val headerRequest = HeaderRequest(request.url)
         val headerRequestInfo = headerRequest.execute() ?: throw Exception("Null Header request")
-//        rangeEnabled = headerRequestInfo.acceptRange
+        rangeEnabled = headerRequestInfo.acceptRange
 
         val savedRequestInfo = saveFileHandler.getSavedRequestInfo()
 
         val initTasks: ArrayList<DownloadTask> = arrayListOf()
 
+        totalByteNeedToDownload = headerRequestInfo.contentLength
         if (savedRequestInfo != null && savedRequestInfo.savedTasks.isNotEmpty()) {
             for ((i, savedTask) in savedRequestInfo.savedTasks.withIndex()) {
                 val end = if (i < savedRequestInfo.savedTasks.size - 1) {
@@ -206,24 +224,31 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
                     url = request.url,
                     start = savedTask.start,
                     byteSaved = savedTask.byteSaved,
-                    end = end
+                    end = end,
+                    useRangeRequest = rangeEnabled || savedRequestInfo.savedTasks.size >= 2
                 ))
             }
-
-            totalByteNeedToDownload = initTasks.sumOf { (it.end - it.start - it.byteSaved).coerceAtLeast(0) }
         } else {
-            initTasks.add(DownloadTask(
-                url = request.url,
-                start = 0,
-                byteSaved = 0,
-                end = headerRequestInfo.contentLength
-            ))
-            totalByteNeedToDownload = headerRequestInfo.contentLength
+            val startTaskCount = if (rangeEnabled) request.startThreadCount.coerceAtLeast(1) else 1
+            var max = headerRequestInfo.contentLength
+            var start = 0L
+            for (i in 0 until startTaskCount) {
+                val end = (max * (i + 1)) / startTaskCount
+                initTasks.add(DownloadTask(
+                    url = request.url,
+                    start =  start,
+                    byteSaved = 0,
+                    end = end,
+                    useRangeRequest = rangeEnabled
+                ))
+                start = end
+            }
         }
 
-        if (totalByteNeedToDownload == 0L) {
+        val remainFromDownloaded = initTasks.sumOf { (it.end - it.start - it.byteSaved).coerceAtLeast(0) }
+        if (remainFromDownloaded == 0L) {
             if (savedRequestInfo != null) {
-                val finalProgress = InternalPartialProgress(0)
+                val finalProgress = Internal1PartialProgress(0)
                 finalProgress.progress.add(headerRequestInfo.contentLength)
                 progressState.send(InternalDownloadProgress(
                     arrayListOf(finalProgress)
@@ -238,7 +263,7 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
         }
     }
 
-    private fun tryCreateNewTask() {
+    private suspend fun tryCreateNewTask() {
         if (!rangeEnabled) {
             return
         }
@@ -247,6 +272,7 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
         var largestByteDownloaded: LongAdder? = null
         var newEnd: Long? = null
 
+        val updateTaskResult: Boolean
         synchronized(tasks) {
             for (task in tasks) {
                 val byteDownloaded = byteDownloadedMap[task.id]!!
@@ -262,37 +288,35 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
                 return
             }
 
-
             val byteDownloaded = largestByteDownloaded!!.toLong()
             newEnd = largestRemainTask.start + byteDownloaded +
                     ((largestRemainTask.end - largestRemainTask.start - byteDownloaded) / 2)
 
-            updateTask(largestRemainTask, newEnd)
+            updateTaskResult = updateTask(largestRemainTask, newEnd)
         }
 
-        if (largestRemainTask != null && newEnd != null) {
-            executorScope.launch {
-                pushTask(DownloadTask(
-                    url = largestRemainTask.url,
-                    start = newEnd,
-                    end = largestRemainTask.end,
-                    byteSaved = 0
-                ))
-            }
+        if (updateTaskResult && largestRemainTask != null && newEnd != null) {
+            pushTask(DownloadTask(
+                url = largestRemainTask.url,
+                start = newEnd,
+                end = largestRemainTask.end,
+                byteSaved = 0,
+                useRangeRequest = rangeEnabled
+            ))
         }
     }
 
-    private fun updateTask(task: DownloadTask, newEnd: Long) {
-        val connection = downloadConnectionPool.findConnection(task) ?: return
-        connection.updateEnd(newEnd)
+    private fun updateTask(task: DownloadTask, newEnd: Long): Boolean {
+        val connection = downloadConnectionPool.findConnection(task) ?: return false
         val result = tasks.removeIf { it.equals(task) } && tasks.add(task.copyWith(newEnd))
-        if (!result) {
-            throw IllegalStateException("update task failed");
+        if (result) {
+            connection.updateEnd(newEnd)
         }
+        return result
     }
 
     override fun onTotalSpeedIncreased() {
-        executorScope.launch {
+        executorScope.launch(scopeErrorHandler) {
             tryCreateNewTask()
         }
     }
