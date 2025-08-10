@@ -248,7 +248,7 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
         val remainFromDownloaded = initTasks.sumOf { (it.end - it.start - it.byteSaved).coerceAtLeast(0) }
         if (remainFromDownloaded == 0L) {
             if (savedRequestInfo != null) {
-                val finalProgress = Internal1PartialProgress(0)
+                val finalProgress = InternalPartialProgress(0)
                 finalProgress.progress.add(headerRequestInfo.contentLength)
                 progressState.send(InternalDownloadProgress(
                     arrayListOf(finalProgress)
