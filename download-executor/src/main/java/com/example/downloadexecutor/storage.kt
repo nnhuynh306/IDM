@@ -33,18 +33,20 @@ data class SavedTask(
     val byteSaved: Long
 )
 
-interface SaveFileHandler {
+interface FileHandler {
+    suspend fun initialize()
     suspend fun saveToPartFile(task: DownloadTask, byteArray: ByteArray, byteCount: Int, onFinish: suspend () -> Unit)
     suspend fun getSavedRequestInfo(): SavedRequestInfo?
     suspend fun mergeParts()
+    suspend fun clearAll()
 }
 
-internal class SaveFileHandlerImpl(val destination: String): SaveFileHandler {
+internal class FileHandlerImpl(val destination: String): FileHandler {
     val partFileContainer: InternalDirectory = InternalDirectory(destination)
 
     val saverMap = ConcurrentHashMap<String, PartFileSaver>()
 
-    init {
+    override suspend fun initialize() {
         partFileContainer.mkdirs()
     }
 
@@ -130,6 +132,13 @@ internal class SaveFileHandlerImpl(val destination: String): SaveFileHandler {
                 }
             }
             partFileContainer.delete()
+        }
+    }
+
+    override suspend fun clearAll() {
+        withContext(Dispatchers.IO) {
+            partFileContainer.deleteRecursively()
+            File(destination).delete()
         }
     }
 

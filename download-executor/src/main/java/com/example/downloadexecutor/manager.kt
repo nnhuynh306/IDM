@@ -16,11 +16,12 @@ interface DownloadManager {
     fun download(request: DownloadRequest): Flow<Result<DownloadProgress>>
     fun stop(request: DownloadRequest)
     suspend fun getHeaderInfo(url: String): HeaderRequestInfo
+    suspend fun cleanRequest(request: DownloadRequest)
 }
 
 internal class DownloadManagerImpl: DownloadManager {
 
-    val handlerMap = ConcurrentHashMap<String, SaveFileHandler>()
+    val handlerMap = ConcurrentHashMap<String, FileHandler>()
 
     val dispatcher = Dispatchers.IO
 
@@ -69,6 +70,7 @@ internal class DownloadManagerImpl: DownloadManager {
     }
 
     override fun download(request: DownloadRequest): Flow<Result<DownloadProgress>> {
+        stop(request)
         return getExecutor(request).start()
     }
 
@@ -81,10 +83,14 @@ internal class DownloadManagerImpl: DownloadManager {
         return headerRequest.execute() ?: throw Exception("Null Header request")
     }
 
-    fun getSaveFileHandlerFor(request: DownloadRequest): SaveFileHandler {
+    override suspend fun cleanRequest(request: DownloadRequest) {
+        getSaveFileHandlerFor(request).clearAll()
+    }
+
+    fun getSaveFileHandlerFor(request: DownloadRequest): FileHandler {
         val path = request.saveFileName;
         return handlerMap.getOrPut(path) {
-            SaveFileHandlerImpl(path)
+            FileHandlerImpl(path)
         }
     }
 }

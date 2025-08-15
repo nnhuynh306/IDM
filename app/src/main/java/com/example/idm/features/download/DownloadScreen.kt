@@ -1,18 +1,19 @@
 package com.example.idm.features.download
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.net.Uri
-import android.os.Environment
 import android.provider.DocumentsContract
-import android.webkit.URLUtil
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -28,17 +30,25 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.outlined.RemoveCircleOutline
 import androidx.compose.material.icons.rounded.PauseCircleOutline
 import androidx.compose.material.icons.rounded.PlayCircleOutline
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.BasicAlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -47,24 +57,25 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.app.ActivityCompat.startActivityForResult
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.downloadexecutor.PartialProgress
 import com.example.idm.core.data.model.FileInfo
 import com.example.idm.core.data.model.PartProgress
 import com.example.idm.core.data.model.Status
-import com.example.idm.core.design.theme.IDMTheme
-import kotlinx.coroutines.flow.update
 import androidx.core.net.toUri
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DownloadScreen(
     viewModel: DownloadScreenViewModel = hiltViewModel()
@@ -101,11 +112,35 @@ fun DownloadScreen(
                     localContext.getExternalFilesDir(null)!!.absolutePath
                 )
             },
+            onDeleteItem = {
+                viewModel.deleteFile(it)
+            },
             onTextChanged = {
                 viewModel.updateUrlText(it)
             }
         )
     }
+}
+fun openFile(context: Context, pickerInitialUri: Uri) {
+    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        addCategory(Intent.CATEGORY_OPENABLE)
+        type = "application/pdf"
+
+        // Optionally, specify a URI for the file that should appear in the
+        // system file picker when it loads.
+        putExtra(DocumentsContract.EXTRA_INITIAL_URI, pickerInitialUri)
+    }
+
+    startActivityForResult(context.getActivity(), intent, 111, null)
+}
+
+private fun Context.getActivity(): Activity {
+    var context = this
+    while (context is ContextWrapper) {
+        if (context is Activity) return context
+        context = context.baseContext
+    }
+    error("Activity not found")
 }
 
 @Composable
@@ -113,6 +148,7 @@ fun DownloadScreenContent(
     modifier: Modifier = Modifier,
     uiState: DownloadScreenState,
     onFileItemButtonClick: (FileInfo) -> Unit,
+    onDeleteItem: (FileInfo) -> Unit,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
     onTextChanged: (String) -> Unit
@@ -151,8 +187,12 @@ fun DownloadScreenContent(
                         onButtonClick = {
                             onFileItemButtonClick(fileInfo)
                         },
-                        onItemClick = {
-                            context.startActivity(Intent("android.intent.action.VIEW_DOWNLOADS"))
+                        onDelete = {
+                            onDeleteItem(fileInfo)
+                        },
+                        onGoToFileDestination = {
+                            openFile(context, fileInfo.destination.toUri())
+//                            context.startActivity(Intent("android.intent.action.VIEW_DOWNLOADS"))
                         }
                     )
                 }
@@ -170,63 +210,162 @@ fun DownloadScreenContent(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FileItem(
     fileInfo: FileInfo,
     onButtonClick: () -> Unit,
-    onItemClick: () -> Unit,
+    onDelete: () -> Unit,
+    onGoToFileDestination: () -> Unit,
 ) {
     val status by fileInfo.status.collectAsStateWithLifecycle()
 
+    var showConfirmDialog by remember { mutableStateOf(false) }
+
+    if (showConfirmDialog) {
+        AlertDialog(
+            title = {
+                Text(
+                    "Confirm",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            },
+            text = {
+                Text("Do you want to delete this request?")
+            },
+            onDismissRequest = {
+                showConfirmDialog = false
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = {
+                        showConfirmDialog = false
+                    },
+                ) {
+                    Text("Cancel")
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onDelete()
+                    }
+                ) {
+                    Text("OK")
+                }
+            }
+        )
+    }
+
     Card(
         modifier = Modifier
-            .clickable(
-                enabled = status == Status.Finished,
-                onClick = onItemClick
-            )
+
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(8.dp)
+
         ) {
             Row(
                 modifier = Modifier
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+                    .padding(8.dp)
+                    .height(IntrinsicSize.Max),
             ) {
                 Column(
                     modifier = Modifier
                         .weight(1f)
+                        .fillMaxHeight(),
+                    verticalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(fileInfo.requestUrl, maxLines = 1)
-                    Spacer(Modifier.height(10.dp))
-                    Text(fileInfo.name)
+                    Box(
+                        modifier = Modifier
+                            .heightIn(min = 48.dp),
+                    ) {
+                        Text(
+                            fileInfo.requestUrl,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .align(Alignment.CenterStart),
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .height(64.dp),
+                    ) {
+                        Text(
+                            fileInfo.name,
+                            modifier = Modifier
+                                .align(Alignment.CenterStart),
+                        )
+                    }
                 }
 
-                IconButton(
-                    onClick = onButtonClick
+                Column(
+                    horizontalAlignment = Alignment.End,
+                    modifier = Modifier
+                        .padding(start = 12.dp)
                 ) {
-                    when(status) {
-                        is Status.NotStarted, is Status.Paused, is Status.Error -> {
-                            Icon(
-                                imageVector = Icons.Rounded.PlayCircleOutline,
-                                contentDescription = "",
-                                tint = Color.Green
-                            )
+
+                    var expanded by remember { mutableStateOf(false) }
+
+                    Box(
+                        modifier = Modifier
+
+                    ) {
+                        IconButton(onClick = { expanded = !expanded }) {
+                            Icon(Icons.Default.MoreVert, contentDescription = "More options")
                         }
-                        is Status.Downloading, is Status.Finalizing -> {
-                            Icon(
-                                imageVector = Icons.Rounded.PauseCircleOutline,
-                                contentDescription = "",
-                                tint = Color.Gray
+
+                        DropdownMenu(
+                            expanded = expanded,
+                            onDismissRequest = { expanded = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Delete") },
+                                onClick = {
+                                    showConfirmDialog = true
+                                }
                             )
+
+                            if (status == Status.Finished) {
+                                DropdownMenuItem(
+                                    text = { Text("Go to file") },
+                                    onClick = onGoToFileDestination
+                                )
+                            }
                         }
-                        is Status.Finished -> {
-                            Icon(
-                                imageVector = Icons.Outlined.RemoveCircleOutline,
-                                contentDescription = "",
-                                tint = Color.Red
-                            )
+                    }
+
+                    if (status !is Status.Finished) {
+                        IconButton(
+                            modifier = Modifier
+                                .size(64.dp),
+                            onClick = onButtonClick
+                        ) {
+                            when(status) {
+                                is Status.NotStarted, is Status.Paused, is Status.Error -> {
+                                    Icon(
+                                        modifier = Modifier
+                                            .size(42.dp),
+                                        imageVector = Icons.Rounded.PlayCircleOutline,
+                                        contentDescription = "",
+                                        tint = Color.Green
+                                    )
+                                }
+                                is Status.Downloading, is Status.Finalizing -> {
+                                    Icon(
+                                        modifier = Modifier
+                                            .size(42.dp),
+                                        imageVector = Icons.Rounded.PauseCircleOutline,
+                                        contentDescription = "",
+                                        tint = Color.Gray
+                                    )
+                                }
+
+                                Status.Finished -> TODO()
+                            }
                         }
                     }
                 }
@@ -245,7 +384,10 @@ fun StatusView(status: Status, totalFileSize: Long) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .padding(8.dp)
     ) {
+        HorizontalDivider()
+
         Spacer(Modifier.height(10.dp))
 
         Text(

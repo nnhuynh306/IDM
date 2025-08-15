@@ -92,13 +92,17 @@ class DownloadScreenViewModel @Inject constructor(
                 stop(fileInfo)
             }
             Status.Finished -> {
-                viewModelScope.launch {
-                    fileRepository.remove(fileInfo)
-                }
+
             }
             Status.NotStarted, is Status.Paused, is Status.Error -> {
                 startOrResume(fileInfo)
             }
+        }
+    }
+
+    fun deleteFile(fileInfo: FileInfo) {
+        viewModelScope.launch {
+            fileRepository.remove(fileInfo)
         }
     }
 

@@ -33,7 +33,7 @@ internal sealed interface ExecutorStatus {
 }
 
 internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
-                                                 val saveFileHandler: SaveFileHandler)
+                                                 val fileHandler: FileHandler)
     : NetworkTaskExecutor, SpeedListener {
     private val tasks: ConcurrentLinkedQueue<DownloadTask> = ConcurrentLinkedQueue()
 
@@ -61,6 +61,8 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
     private var isFinalized = false
     private var finalizedLock = Object()
 
+    private var isStopped = false;
+
     private val scopeErrorHandler = CoroutineExceptionHandler { _, exception ->
         sendStopOnException(exception)
     }
@@ -78,11 +80,13 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
         { progress, speed, status ->
 
             if (status is ExecutorStatus.Error) {
+                println("Stop on error ${status.exception.toString()}")
                 internalStop()
                 return@combine Result.failure(status.exception)
             }
 
             if (status is ExecutorStatus.Stop) {
+                println("Stop on stop")
                 internalStop()
                 return@combine Result.success(DownloadProgress(
                     progress.byteDownloaded,
@@ -92,6 +96,8 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
             }
 
             if (status is ExecutorStatus.End) {
+                println("Stop on end")
+                internalStop()
                 return@combine Result.success(DownloadProgress(
                     progress.byteDownloaded,
                     speed = speed,
@@ -133,7 +139,7 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
         }
         executorScope.launch(scopeErrorHandler) {
             if (canFinalize) {
-                saveFileHandler.mergeParts()
+                fileHandler.mergeParts()
                 internalStop()
                 statusFlow.update {
                     ExecutorStatus.End
@@ -144,6 +150,10 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
     }
 
     private fun internalStop() {
+        if (isStopped) {
+            return
+        }
+        isStopped = true
         downloadConnectionPool.cleanUp()
         speedMonitor.stop()
         progressState.close()
@@ -188,7 +198,7 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
                     val byteArray = it.second
                     speedMonitor.addByteCount(byteCount.toLong())
                     byteDownloaded.add(byteCount.toLong())
-                    saveFileHandler.saveToPartFile(task = task, byteArray = byteArray, byteCount = byteCount) {
+                    fileHandler.saveToPartFile(task = task, byteArray = byteArray, byteCount = byteCount) {
                         if (!progressState.isClosedForSend) {
                             progressState.send(progress.updateWith(task, byteCount))
                         }
@@ -207,7 +217,9 @@ internal class DynamicSegmentNetworkTaskExecutor(val request: DownloadRequest,
         val headerRequestInfo = headerRequest.execute() ?: throw Exception("Null Header request")
         rangeEnabled = headerRequestInfo.acceptRange
 
-        val savedRequestInfo = saveFileHandler.getSavedRequestInfo()
+        fileHandler.initialize()
+
+        val savedRequestInfo = fileHandler.getSavedRequestInfo()
 
         val initTasks: ArrayList<DownloadTask> = arrayListOf()
 

@@ -87,12 +87,9 @@ class FileRepositoryImpl @Inject constructor(
         val statusState = getCurrentStatusOf(url = url, destination = destination)
         downloadManager.download(DownloadRequest(
             url = url,
-            saveFileName = destination
+            saveFileName = destination,
+            startThreadCount = 4,
         ))
-            .transformWhile {
-                emit(it)
-                it.isSuccess
-            }
             .collect {
                 if (it.isSuccess) {
                     val progressResult = it.getOrThrow()
@@ -123,7 +120,9 @@ class FileRepositoryImpl @Inject constructor(
                         }
                     }
                 } else {
-                    Status.Error(it.exceptionOrNull()!!)
+                    statusState.update { currentState ->
+                        Status.Error(it.exceptionOrNull()!!)
+                    }
                 }
             }
     }
@@ -149,8 +148,10 @@ class FileRepositoryImpl @Inject constructor(
 
     override suspend fun remove(fileInfo: FileInfo) {
         downloadRequestDao.delete(destination = fileInfo.destination)
-        withContext(dispatcher) {
-            File(fileInfo.destination).delete()
-        }
+        downloadManager.cleanRequest(DownloadRequest(
+            url = fileInfo.requestUrl,
+            saveFileName = fileInfo.destination
+        ))
+        statusMap.remove(fileInfo.destination)
     }
 }
